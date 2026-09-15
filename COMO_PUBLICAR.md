@@ -234,38 +234,17 @@ Ele valida as regras junto com o resto. Passando, cole o
 > O arquivo cobre os **três** apps. Publicar uma versão que só tenha o `cogni`
 > derrubaria o NEXUS na hora.
 
-### 2.2 Crie o nó `_release`
+### 2.2 O nó `_release` vem depois
 
-No Realtime Database **não existe caminho vazio** — o nó nasce quando recebe
-dado. O caminho é **`_release`, no singular**:
+Publique **só as Regras** agora e siga para a Parte 3.
 
-```
-/apps/cogni/_release/stable
-```
+O nó `/apps/cogni/_release/stable` é criado na
+[Parte 4.3](#43-crie-o-nó-_release-no-firebase), depois do build — porque ele
+guarda o hash e a URL de um instalador que ainda não existe.
 
-1. Console → Realtime Database → aba **Dados**
-2. Expanda `apps` → `cogni`
-3. Passe o mouse em `cogni`, clique no **`+`**
-4. Nome: `_release` → clique no **`+`** ao lado do valor (isso aninha)
-5. Nome: `stable` → aninhe outra vez
-6. Nome: `version`, valor: `4.5.0` → **Adicionar**
-
-Depois, para preencher o resto de uma vez: clique em `stable`, menu **⋮** →
-**Importar JSON** → escolha o `dist_installer\manifest-4.5.0.json`.
-
-> **Importar JSON substitui o nó em que você está.** Faça só dentro de
-> `stable`. Em `/apps/cogni` apagaria `users` — seus dados de estudo.
-
-### 2.3 Confirme a leitura pública
-
-Abra no navegador, **deslogado**:
-
-```
-https://cogni-data-default-rtdb.firebaseio.com/apps/cogni/_release/stable.json
-```
-
-Tem de devolver o JSON. `null` = nome errado. `Permission denied` = regras não
-publicadas.
+No Realtime Database não existe caminho vazio: um nó nasce quando recebe dado.
+Criá-lo antes de ter o manifesto significaria preencher à mão os sete campos
+e depois corrigir o hash, que é justamente o campo que não se digita.
 
 ---
 
@@ -293,6 +272,18 @@ cd C:\Dev\cogni
 O script sincroniza a versão nos três arquivos, compila, empacota, calcula o
 SHA-256 e imprime o manifesto pronto.
 
+**É este passo que cria a pasta `dist_installer\`.** Antes de rodá-lo ela não
+existe — o `build.ps1` é quem a gera, com dois arquivos dentro:
+
+```
+dist_installer\COGNI-Setup-4.5.1.exe      o instalador que voce distribui
+dist_installer\manifest-4.5.1.json        o manifesto para o Firebase
+```
+
+Se o Inno Setup não estiver instalado, você fica só com
+`dist\COGNI\COGNI.exe` e nenhum `dist_installer`. O script diz isso
+explicitamente e dá o comando para instalar.
+
 | Flag | Para quê |
 |---|---|
 | `-SkipInstaller` | Só o `.exe` |
@@ -318,7 +309,11 @@ No app, confirme:
 
 ## Parte 4 — Publicar
 
-### Um comando
+A ordem desta parte importa. **Manifesto é o último passo, sempre.** Se você
+publicar o manifesto antes do instalador existir na URL, todo usuário que
+abrir o Cogni verá uma atualização que falha ao baixar.
+
+### 4.1 Um comando
 
 ```powershell
 .\release.ps1 -Version 4.5.1 -Notes "- Correcoes de seguranca"
@@ -334,6 +329,61 @@ Ele faz, parando em qualquer erro:
 6. Imprime o manifesto
 
 Antes, veja o que faria: `.\release.ps1 -Version 4.5.1 -DryRun`
+
+### 4.2 Confirme que a URL baixa o arquivo
+
+Abra no navegador a URL que aparece no campo `url` do manifesto impresso:
+
+```
+https://github.com/iamcaio/cogni-dist/releases/download/v4.5.1/COGNI-Setup-4.5.1.exe
+```
+
+**Se ela não baixar o instalador, pare aqui.** Publicar o manifesto com uma
+URL que não funciona é o erro mais chato deste processo: o app vê a
+atualização, tenta baixar, falha, e você vai procurar defeito no updater.
+
+### 4.3 Crie o nó `_release` no Firebase
+
+Agora sim — o manifesto existe e a URL está confirmada.
+
+O caminho é **`_release`, no singular**:
+
+```
+/apps/cogni/_release/stable
+```
+
+**Na primeira vez**, o nó não existe. No Realtime Database não há caminho
+vazio: ele nasce quando recebe dado.
+
+1. Console → Realtime Database → aba **Dados**
+2. Expanda `apps` → `cogni`
+3. Passe o mouse em `cogni`, clique no **`+`**
+4. Nome: `_release` → clique no **`+`** ao lado do valor (isso aninha em vez
+   de gravar um valor solto)
+5. Nome: `stable` → aninhe outra vez
+6. Nome: `version`, valor: `4.5.1` → **Adicionar**
+
+O caminho passa a existir. Para preencher os outros seis campos de uma vez:
+
+7. Clique em `stable` na árvore
+8. Menu **⋮** → **Importar JSON** → escolha
+   `dist_installer\manifest-4.5.1.json`
+
+> **Importar JSON substitui o nó em que você está.** Faça só dentro de
+> `stable`. Em `/apps/cogni` apagaria `users` — suas anotações e matérias.
+
+**Nas versões seguintes**, o nó já existe: vá direto ao passo 7.
+
+### 4.4 Confirme a leitura pública
+
+Abra no navegador, **deslogado**:
+
+```
+https://cogni-data-default-rtdb.firebaseio.com/apps/cogni/_release/stable.json
+```
+
+Tem de devolver o JSON — é exatamente assim que o Cogni lê, antes de qualquer
+login. `null` = nome do nó errado. `Permission denied` = Regras não publicadas.
 
 ### Sem o `gh`: o passo 5 vira manual
 
@@ -546,6 +596,20 @@ gh auth status
 ```
 
 Se disser que não está autenticado, rode `gh auth login` de novo.
+
+### A pasta `dist_installer` não existe
+
+Ela é **criada pelo `build.ps1`**, não vem no projeto. Se não existe, o build
+ainda não rodou — ou rodou e parou antes de empacotar.
+
+```powershell
+cd C:\Dev\cogni
+.\build.ps1 -Version 4.5.1
+```
+
+Se o build terminar e você tiver `dist\COGNI\COGNI.exe` mas **não** tiver
+`dist_installer`, o Inno Setup não está instalado. O script avisa isso e dá o
+comando. Veja a seção abaixo.
 
 ### `ISCC.exe nao encontrado`
 
