@@ -1,0 +1,46 @@
+# ===========================================================================
+#  Cogni — .gitignore (repositorio PRIVADO)
+# ===========================================================================
+#  Este repositorio e privado e contem o codigo. O que NAO pode entrar aqui e
+#  dado do usuario e artefato de build.
+#
+#  O repositorio PUBLICO (cogni-dist) nao usa este arquivo: ele nao recebe
+#  commit nenhum. So o .exe anexado ao Release.
+# ===========================================================================
+
+# ---- DADOS DO USUARIO. Nunca versionar. ----
+# O banco fica em C:\COGNI\db, fora desta pasta. Estas linhas cobrem o caso de
+# alguem copiar o banco para ca por engano.
+db/
+docs/
+*.db
+database.json
+database.json.bak
+cloud_session.json
+cloud_config.json
+avatar.dat
+
+# ---- Artefatos de build. Regeraveis. ----
+build/
+dist/
+dist_installer/
+__pycache__/
+*.pyc
+*.pyo
+*.exe
+*.msi
+
+# ---- Dossie de seguranca. Descreve falhas e limites em aberto. ----
+SEGURANCA.md
+auditoria*.md
+
+# ---- Ambientes e ferramentas ----
+.venv/
+venv/
+env/
+node_modules/
+.idea/
+.vscode/
+*.log
+Thumbs.db
+desktop.ini

@@ -1,0 +1,43 @@
+# ===========================================================================
+#  Cogni — normalizacao de fim de linha
+# ===========================================================================
+#  Sem este arquivo, o comportamento depende da configuracao de cada maquina e
+#  um dia aparece um commit que "mudou 4100 linhas" sem ninguem ter editado
+#  nada. A regra fica no repositorio e vale para todos.
+# ===========================================================================
+
+* text=auto
+
+*.py     text diff=python
+*.js     text
+*.json   text
+*.md     text
+*.txt    text
+*.spec   text
+*.yml    text
+*.yaml   text
+
+# Estes PRECISAM de CRLF no disco.
+*.ps1    text eol=crlf
+*.psm1   text eol=crlf
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+*.iss    text eol=crlf
+
+# Binarios: marcar explicitamente evita que o git tente "consertar" fim de
+# linha dentro deles, o que os corromperia.
+*.ico    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.pdf    binary
+*.exe    binary
+*.dll    binary
+*.zip    binary
+*.xlsx   binary
+*.docx   binary
+
+.gitattributes  export-ignore
+.gitignore      export-ignore
+build_tools/    export-ignore
