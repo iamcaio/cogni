@@ -44,7 +44,11 @@ param(
     [string]$RepoPrivado = "iamcaio/cogni",
     [string]$RepoPublico = "iamcaio/cogni-dist",
     [switch]$DryRun,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # Retoma SO o passo 5 (Release no publico). Use quando o build, o commit e
+    # a tag ja passaram e a publicacao falhou - assim voce nao precisa
+    # inventar uma versao nova so para repetir a ultima etapa.
+    [switch]$OnlyRelease
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,11 +71,23 @@ if ($DryRun) {
     Write-Host "`n*** MODO DRY-RUN - nada sera alterado ***" -ForegroundColor Magenta
 }
 
+# -OnlyRelease implica pular o build: o instalador ja existe em disco.
+if ($OnlyRelease) {
+    $SkipBuild = $true
+    Write-Host "`n*** -OnlyRelease: retomando SO o passo 5 ***" -ForegroundColor Magenta
+    Write-Host "    build, verificacao, commit e tag serao pulados." -ForegroundColor DarkGray
+}
+
 # ---------------------------------------------------------------------------
 #  0. A versao nao pode ser menor que a ultima publicada
 # ---------------------------------------------------------------------------
 $tags = @(git tag -l "v*" 2>$null)
-if ($tags.Count -gt 0) {
+if ($OnlyRelease) {
+    # Com -OnlyRelease a tag desta versao JA existe, de proposito: e a que
+    # estamos terminando de publicar. Checar "maior que a ultima" aqui
+    # abortaria o retry, que e exatamente o que queremos permitir.
+    Detalhe "-OnlyRelease: checagem de versao pulada"
+} elseif ($tags.Count -gt 0) {
     $maior = $tags |
         ForEach-Object { [version]($_ -replace '^v', '') } |
         Sort-Object -Descending |
@@ -141,6 +157,10 @@ if ($Notes) {
 }
 Detalhe "mensagem: $msg"
 
+if ($OnlyRelease) {
+    Detalhe "-OnlyRelease: commit, tag e push pulados (ja foram feitos)"
+}
+
 # Trava de seguranca: se o remoto 'origin' for o repositorio PUBLICO, abortar.
 # Um push de codigo para la exporia tudo que estamos tentando nao expor.
 $origem = (git remote get-url origin 2>$null)
@@ -161,12 +181,14 @@ if ($origem) {
     Aviso "  git remote add origin https://github.com/$RepoPrivado.git"
 }
 
-Executar "git add -A ."
-$pendente = git diff --cached --name-only
-if (-not $pendente -and -not $DryRun) {
-    Aviso "nada para commitar - o codigo ja esta commitado nesta versao"
-} else {
-    Executar "git commit -m `"$msg`""
+if (-not $OnlyRelease) {
+    Executar "git add -A ."
+    $pendente = git diff --cached --name-only
+    if (-not $pendente -and -not $DryRun) {
+        Aviso "nada para commitar - o codigo ja esta commitado nesta versao"
+    } else {
+        Executar "git commit -m `"$msg`""
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -174,10 +196,16 @@ if (-not $pendente -and -not $DryRun) {
 # ---------------------------------------------------------------------------
 Etapa 4 "Tag v$versaoReal e push"
 
+if ($OnlyRelease) {
+    Detalhe "pulado (-OnlyRelease)"
+} else {
+
 $existe = git tag -l "v$versaoReal"
 if ($existe) {
     throw "A tag v$versaoReal ja existe. Escolha outra versao - reutilizar tag " +
-          "faz o Release apontar para codigo diferente do que ele diz conter."
+          "faz o Release apontar para codigo diferente do que ele diz conter.`n" +
+          "  Se a tag esta certa e apenas a PUBLICACAO falhou, retome com:`n" +
+          "    .\release.ps1 -Version $versaoReal -OnlyRelease"
 }
 Executar "git tag -a v$versaoReal -m `"$msg`""
 
@@ -187,6 +215,8 @@ if ($origem) {
 } else {
     Aviso "sem remoto configurado: push ignorado"
 }
+
+}  # fim do else de -OnlyRelease
 
 # ---------------------------------------------------------------------------
 #  5. RELEASE no repositorio PUBLICO - somente o instalador
@@ -201,6 +231,35 @@ if (-not (Test-Path $setup)) {
 } else {
     $gh = Get-Command gh -ErrorAction SilentlyContinue
     if ($gh) {
+        # -------------------------------------------------------------------
+        # O GitHub recusa criar Release em repositorio SEM NENHUM COMMIT, com
+        # "HTTP 422: Repository is empty". Um repositorio criado sem README
+        # nao tem commit nem branch padrao, e nao ha onde ancorar a tag.
+        #
+        # Em vez de deixar isso estourar na sua cara, damos o primeiro commit
+        # aqui: um README de tres linhas dizendo que o repositorio so hospeda
+        # instaladores. Ele nao expoe nada - nenhum codigo, nenhuma estrutura.
+        # -------------------------------------------------------------------
+        $vazio = $false
+        try {
+            gh api "repos/$RepoPublico/commits" --jq 'length' 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { $vazio = $true }
+        } catch { $vazio = $true }
+
+        if ($vazio) {
+            Aviso "$RepoPublico esta vazio (sem commits) - criando o README inicial"
+            $texto = "# Cogni - Instaladores`n`n" +
+                     "Este repositorio contem apenas os instaladores do Cogni.`n" +
+                     "Nao ha codigo-fonte aqui.`n"
+            $b64 = [Convert]::ToBase64String(
+                [Text.Encoding]::UTF8.GetBytes($texto))
+            Executar ("gh api repos/$RepoPublico/contents/README.md -X PUT " +
+                      "-f message=`"Repositorio de distribuicao`" " +
+                      "-f content=`"$b64`"")
+            Detalhe "primeiro commit criado; o Release agora tem onde ancorar"
+            Start-Sleep -Seconds 2
+        }
+
         $notasRelease = if ($Notes) { $Notes } else { "Versao $versaoReal" }
         # --repo aponta para o PUBLICO. --target nao e usado: o repositorio
         # publico nao tem o codigo, entao a tag do Release e criada nele

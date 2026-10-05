@@ -21,7 +21,7 @@
 ; ===========================================================================
 
 #define MyAppName        "Cogni"
-#define MyAppVersion     "4.5.1"
+#define MyAppVersion     "4.5.4"
 #define MyAppPublisher   "COGNI"
 #define MyAppExeName     "COGNI.exe"
 
@@ -78,8 +78,12 @@ Name: "C:\COGNI\docs"; Flags: uninsneveruninstall
 Source: "dist\COGNI\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}";  Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+; AppUserModelID precisa ser IDENTICO a constante APP_AUMID do cogni.py e ao
+; AUMID usado no toast do WindowsNotifier - sem isso a notificacao sai
+; assinada como "Windows PowerShell" em vez de "Cogni" (mesma causa raiz ja
+; resolvida no NEXUS: ver nexus_installer.iss).
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "iamcaio.Cogni"
+Name: "{autodesktop}\{#MyAppName}";  Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "iamcaio.Cogni"; Tasks: desktopicon
 
 [Run]
 ; skipifsilent: num update automatico o app e reaberto pelo RestartApplications,

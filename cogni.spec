@@ -1,12 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+import certifi
 
 a = Analysis(
     ['cogni.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    # 'vendor' entra inteiro: Tailwind, Font Awesome, Chart.js e Inter
+    # empacotados junto do .exe, para a interface abrir sem internet
+    # (ver _recursos_dir()/_vendor_uri() em cogni.py).
+    datas=[(certifi.where(), 'certifi'), ('vendor', 'vendor')],
+    hiddenimports=['certifi', 'webview'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -14,6 +17,7 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -21,7 +25,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='cogni',
+    name='COGNI',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -34,6 +38,7 @@ exe = EXE(
     entitlements_file=None,
     icon=['cogni.ico'],
 )
+
 coll = COLLECT(
     exe,
     a.binaries,
@@ -41,5 +46,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='cogni',
+    name='COGNI',
 )

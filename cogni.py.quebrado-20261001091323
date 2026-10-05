@@ -1,0 +1,1785 @@
+import sys
+import os
+import json
+import time
+import traceback
+import webbrowser
+import urllib.request
+import urllib.error
+import ssl
+
+def show_native_error_dialog(title, message):
+    """Exibe um alerta nativo do Windows em caso de erro critico de inicializacao."""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, str(message), str(title), 0x10)
+    except Exception:
+        print(f"[{title}] {message}")
+
+try:
+    import webview
+except Exception as e:
+    err_msg = (
+        "Nao foi possivel carregar a biblioteca 'pywebview'.\n\n"
+        f"Detalhes do Erro:\n{traceback.format_exc()}\n\n"
+        "Por favor, execute 'pip install pywebview' no terminal do seu computador."
+    )
+    show_native_error_dialog("Erro de Inicializacao - Cogni", err_msg)
+    sys.exit(1)
+
+APP_VERSION = "v4.5.1"
+
+# Caminho legado: onde o Cogni gravava antes de existir login.
+LEGACY_URL = "https://cogni-data-default-rtdb.firebaseio.com/database.json"
+LOCAL_FALLBACK_PATH = r"C:\COGNI\db\database.json"
+DOCS_PATH = r"C:\COGNI\docs"
+
+# ---------------------------------------------------------------------------
+# CAMADA DE NUVEM (Firebase Realtime Database + Firebase Authentication)
+# ---------------------------------------------------------------------------
+APP_NAMESPACE = "cogni"
+FIREBASE_API_KEY = "AIzaSyAvB7jmXgziIMSG3JptOznthGQAP76LWXM"
+FIREBASE_DB_URL = "https://cogni-data-default-rtdb.firebaseio.com"
+IDENTITY_URL = "https://identitytoolkit.googleapis.com/v1/accounts"
+TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
+
+# ---------------------------------------------------------------------------
+# ATUALIZACAO AUTOMATICA
+# ---------------------------------------------------------------------------
+UPDATE_CHANNEL = "stable"
+UPDATE_MANIFEST_URL = (
+    f"{FIREBASE_DB_URL}/apps/{APP_NAMESPACE}/_release/{UPDATE_CHANNEL}.json"
+)
+UPDATE_CHECK_INTERVALO = 6 * 60 * 60
+UPDATE_TAMANHO_MAX = 400 * 1024 * 1024
+
+def _versao_tupla(v):
+    """'v4.5.1' -> (4, 5, 1). Trecho nao-numerico vira 0. Nunca levanta."""
+    try:
+        limpo = str(v or "").strip().lstrip("vV").split("-")[0].split("+")[0]
+        partes = []
+        for p in limpo.split(".")[:4]:
+            digitos = "".join(c for c in p if c.isdigit())
+            partes.append(int(digitos) if digitos else 0)
+        while len(partes) < 3:
+            partes.append(0)
+        return tuple(partes)
+    except Exception:
+        return (0, 0, 0)
+
+def _versao_maior(a, b):
+    return _versao_tupla(a) > _versao_tupla(b)
+
+class AutoUpdater:
+    """
+    Verificacao e aplicacao de atualizacoes do Cogni.
+    """
+    def __init__(self, pasta_dados):
+        import tempfile
+        self.pasta = os.path.join(pasta_dados, "updates")
+        try:
+            os.makedirs(self.pasta, exist_ok=True)
+        except Exception:
+            self.pasta = tempfile.gettempdir()
+        self.manifesto = None
+        self.ultimo_erro = None
+        self.ultima_checagem = 0
+        self._prog = {"fase": "idle", "pct": 0, "recebido": 0,
+                      "total": 0, "mensagem": ""}
+        import threading
+        self._lock = threading.Lock()
+
+    def _set(self, **kw):
+        with self._lock:
+            self._prog.update(kw)
+
+    def progresso(self):
+        with self._lock:
+            return dict(self._prog)
+
+    def verificar(self, forcar=False):
+        agora = time.time()
+        if not forcar and (agora - self.ultima_checagem) < UPDATE_CHECK_INTERVALO \
+                and self.manifesto is not None:
+            return self._resposta_do_manifesto()
+
+        if _ssl_ctx_strict is None:
+            return {"status": "error", "current": APP_VERSION,
+                    "message": "Nao foi possivel montar um contexto TLS seguro nesta maquina."}
+
+        st, corpo = _http_json(UPDATE_MANIFEST_URL, timeout=12, ctx=_ssl_ctx_strict)
+        self.ultima_checagem = agora
+        if st != 200:
+            self.ultimo_erro = f"HTTP {st} ao ler o manifesto."
+            return {"status": "error", "current": APP_VERSION,
+                    "message": "Nao foi possivel consultar atualizacoes no momento."}
+
+        if not isinstance(corpo, dict) or not corpo.get("version"):
+            self.manifesto = None
+            return {"status": "up_to_date", "current": APP_VERSION,
+                    "message": "Nenhuma atualizacao publicada."}
+
+        self.manifesto = corpo
+        return self._resposta_do_manifesto()
+
+    def _resposta_do_manifesto(self):
+        m = self.manifesto or {}
+        nova = m.get("version")
+        if not nova or not _versao_maior(nova, APP_VERSION):
+            return {"status": "up_to_date", "current": APP_VERSION,
+                    "latest": nova or APP_VERSION}
+
+        return {
+            "status": "update_available",
+            "current": APP_VERSION,
+            "latest": nova,
+            "notes": m.get("notes") or "",
+            "size": m.get("size") or 0,
+            "mandatory": bool(m.get("mandatory")),
+            "hasHash": bool(m.get("sha256")),
+        }
+
+    def baixar_e_aplicar(self):
+        import threading
+        t = threading.Thread(target=self._fluxo, daemon=True)
+        t.start()
+        return {"status": "started"}
+
+    def _fluxo(self):
+        try:
+            self._baixar_e_aplicar_sync()
+        except Exception as e:
+            self._set(fase="error", pct=0, mensagem=f"{type(e).__name__}: {e}")
+
+    def _baixar_e_aplicar_sync(self):
+        import hashlib
+        import subprocess
+        m = self.manifesto
+        if not m:
+            self.verificar(forcar=True)
+            m = self.manifesto
+            if not m:
+                self._set(fase="error", mensagem="Nenhuma versao publicada.")
+                return
+
+        url = (m.get("url") or "").strip()
+        esperado = (m.get("sha256") or "").strip().lower()
+
+        if not url.lower().startswith("https://"):
+            self._set(fase="error", mensagem="O manifesto aponta para uma URL nao-HTTPS.")
+            return
+
+        if len(esperado) != 64:
+            self._set(fase="error", mensagem="O manifesto nao traz um SHA-256 valido.")
+            return
+
+        if _ssl_ctx_strict is None:
+            self._set(fase="error", mensagem="Sem TLS verificavel nesta maquina.")
+            return
+
+        nome = os.path.basename(url.split("?")[0]) or "COGNI-update.exe"
+        destino = os.path.join(self.pasta, nome)
+        parcial = destino + ".part"
+
+        self._set(fase="downloading", pct=0, recebido=0, total=0, mensagem="Baixando atualizacao...")
+        h = hashlib.sha256()
+        recebido = 0
+
+        req = urllib.request.Request(url, headers={"User-Agent": f"CogniDesktop/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=60, context=_ssl_ctx_strict) as resp:
+            total = int(resp.headers.get("Content-Length") or m.get("size") or 0)
+            if total and total > UPDATE_TAMANHO_MAX:
+                self._set(fase="error", mensagem="Arquivo maior que o limite permitido.")
+                return
+            self._set(total=total)
+
+            with open(parcial, "wb") as f:
+                while True:
+                    bloco = resp.read(262144)
+                    if not bloco:
+                        break
+                    recebido += len(bloco)
+                    if recebido > UPDATE_TAMANHO_MAX:
+                        f.close()
+                        os.remove(parcial)
+                        self._set(fase="error", mensagem="Download excedeu o limite permitido.")
+                        return
+                    h.update(bloco)
+                    f.write(bloco)
+                    pct = int(recebido * 100 / total) if total else 0
+                    self._set(pct=min(pct, 99), recebido=recebido)
+
+        obtido = h.hexdigest().lower()
+        if obtido != esperado:
+            try:
+                os.remove(parcial)
+            except Exception:
+                pass
+            self._set(fase="error", pct=0, mensagem="A verificacao de integridade (SHA-256) FALHOU.")
+            return
+
+        try:
+            if os.path.exists(destino):
+                os.remove(destino)
+            os.rename(parcial, destino)
+        except Exception as e:
+            self._set(fase="error", mensagem=f"Falha ao salvar: {e}")
+            return
+
+        self._set(fase="verified", pct=100, mensagem="Integridade confirmada. Iniciando instalacao...")
+        time.sleep(0.6)
+
+        try:
+            self._set(fase="installing", pct=100, mensagem="O instalador vai abrir e o Cogni sera reiniciado.")
+            subprocess.Popen(
+                [destino, "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS", "/NORESTART"],
+                close_fds=True,
+                creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+            )
+            time.sleep(1.5)
+            os._exit(0)
+        except Exception as e:
+            self._set(fase="error", mensagem=f"Nao foi possivel iniciar o instalador: {e}")
+
+# ---------------------------------------------------------------------------
+# CONTEXTOS SSL
+# ---------------------------------------------------------------------------
+def _montar_ssl_strict():
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    try:
+        return ssl.create_default_context()
+    except Exception:
+        return None
+
+_ssl_ctx_strict = _montar_ssl_strict()
+_ssl_ctx_inseguro = ssl._create_unverified_context()
+_TLS_DEGRADADO = False
+_TLS_MOTIVO = ""
+
+def _http_json(url, payload=None, method="GET", timeout=15, ctx=None, permitir_fallback=False):
+    global _TLS_DEGRADADO, _TLS_MOTIVO
+    data = None
+    headers = {"User-Agent": f"CogniDesktop/{APP_VERSION}"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    def _executar(contexto):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=timeout, context=contexto) as resp:
+            raw = resp.read().decode("utf-8")
+            try:
+                return resp.status, json.loads(raw) if raw.strip() else None
+            except json.JSONDecodeError:
+                return resp.status, raw
+
+    contexto = ctx or _ssl_ctx_strict
+    try:
+        if contexto is None:
+            raise ssl.SSLError("Nenhum contexto TLS verificavel disponivel.")
+        return _executar(contexto)
+    except urllib.error.HTTPError as e:
+        try:
+            corpo = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            corpo = {"error": {"message": str(e)}}
+        return e.code, corpo
+    except (ssl.SSLError, ssl.SSLCertVerificationError) as e:
+        if not permitir_fallback:
+            return 0, {"error": {"message": f"Nao foi possivel validar o certificado do servidor ({type(e).__name__})."}}
+        try:
+            resultado = _executar(_ssl_ctx_inseguro)
+            _TLS_DEGRADADO = True
+            _TLS_MOTIVO = f"{type(e).__name__}: {e}"
+            return resultado
+        except Exception as e2:
+            return 0, {"error": {"message": f"{type(e2).__name__}: {e2}"}}
+    except urllib.error.URLError as e:
+        motivo = getattr(e, "reason", e)
+        if isinstance(motivo, ssl.SSLError) and permitir_fallback:
+            try:
+                resultado = _executar(_ssl_ctx_inseguro)
+                _TLS_DEGRADADO = True
+                _TLS_MOTIVO = str(motivo)
+                return resultado
+            except Exception as e2:
+                return 0, {"error": {"message": f"{type(e2).__name__}: {e2}"}}
+        return 0, {"error": {"message": f"{type(e).__name__}: {motivo}"}}
+    except Exception as e:
+        return 0, {"error": {"message": f"{type(e).__name__}: {e}"}}
+
+def _mensagem_amigavel(codigo):
+    return {
+        "EMAIL_EXISTS": "Este e-mail ja esta cadastrado. Use 'Entrar'.",
+        "EMAIL_NOT_FOUND": "E-mail nao encontrado. Crie uma conta primeiro.",
+        "INVALID_PASSWORD": "Senha incorreta.",
+        "INVALID_LOGIN_CREDENTIALS": "E-mail ou senha incorretos.",
+        "USER_DISABLED": "Esta conta foi desativada no console do Firebase.",
+        "INVALID_EMAIL": "E-mail invalido.",
+        "TOKEN_EXPIRED": "Sessao expirada. Entre novamente.",
+    }.get(str(codigo), str(codigo))
+
+class CloudSync:
+    def __init__(self, pasta_db):
+        self.config_file = os.path.join(pasta_db, "cloud_config.json")
+        self.session_file = os.path.join(pasta_db, "cloud_session.json")
+        self.api_key = FIREBASE_API_KEY.strip()
+        self.db_url = FIREBASE_DB_URL.strip().rstrip("/")
+        self.id_token = None
+        self.refresh_token = None
+        self.uid = None
+        self.email = None
+        self.expira_em = 0
+        self.ultimo_erro = ""
+        self._carregar_config()
+        self._carregar_sessao()
+
+    def _carregar_config(self):
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                chave = (cfg.get("apiKey") or "").strip()
+                url = (cfg.get("databaseURL") or "").strip().rstrip("/")
+                if chave: self.api_key = chave
+                if url: self.db_url = url
+        except Exception as e:
+            print(f"[Cloud] Config ilegivel: {e}")
+
+    def salvar_config(self, api_key, db_url):
+        self.api_key = (api_key or "").strip()
+        self.db_url = (db_url or "").strip().rstrip("/")
+        try:
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump({"apiKey": self.api_key, "databaseURL": self.db_url}, f, indent=2)
+            return {"status": "success"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    @property
+    def configurado(self):
+        return bool(self.api_key and self.db_url)
+
+    @property
+    def logado(self):
+        return bool(self.uid and self.refresh_token)
+
+    def _carregar_sessao(self):
+        try:
+            if os.path.exists(self.session_file):
+                with open(self.session_file, "r", encoding="utf-8") as f:
+                    s = json.load(f)
+                self.refresh_token = s.get("refreshToken")
+                self.uid = s.get("uid")
+                self.email = s.get("email")
+        except Exception as e:
+            print(f"[Cloud] Sessao ilegivel: {e}")
+
+    def _salvar_sessao(self):
+        try:
+            with open(self.session_file, "w", encoding="utf-8") as f:
+                json.dump({"refreshToken": self.refresh_token,
+                           "uid": self.uid, "email": self.email}, f, indent=2)
+        except Exception as e:
+            print(f"[Cloud] Falha ao gravar sessao: {e}")
+
+    def _limpar_sessao(self):
+        self.id_token = self.refresh_token = self.uid = self.email = None
+        self.expira_em = 0
+        try:
+            if os.path.exists(self.session_file):
+                os.remove(self.session_file)
+        except Exception:
+            pass
+
+    def _aplicar_resposta_auth(self, corpo):
+        self.id_token = corpo.get("idToken")
+        self.refresh_token = corpo.get("refreshToken")
+        self.uid = corpo.get("localId") or corpo.get("user_id")
+        if corpo.get("email"):
+            self.email = corpo["email"]
+        try:
+            self.expira_em = time.time() + int(corpo.get("expiresIn", 3600)) - 120
+        except Exception:
+            self.expira_em = time.time() + 3300
+        self._salvar_sessao()
+
+    def criar_conta(self, email, senha):
+        st, corpo = _http_json(f"{IDENTITY_URL}:signUp?key={self.api_key}",
+                               {"email": email, "password": senha, "returnSecureToken": True},
+                               method="POST")
+        if st == 200 and isinstance(corpo, dict) and corpo.get("idToken"):
+            self._aplicar_resposta_auth(corpo)
+            return {"status": "success", "uid": self.uid, "email": self.email}
+        msg = (corpo or {}).get("error", {}).get("message", "Falha ao criar conta.")
+        return {"status": "error", "message": _mensagem_amigavel(msg)}
+
+    def entrar(self, email, senha):
+        st, corpo = _http_json(f"{IDENTITY_URL}:signInWithPassword?key={self.api_key}",
+                               {"email": email, "password": senha, "returnSecureToken": True},
+                               method="POST")
+        if st == 200 and isinstance(corpo, dict) and corpo.get("idToken"):
+            self._aplicar_resposta_auth(corpo)
+            return {"status": "success", "uid": self.uid, "email": self.email}
+        msg = (corpo or {}).get("error", {}).get("message", "Falha ao entrar.")
+        return {"status": "error", "message": _mensagem_amigavel(msg)}
+
+    def sair(self):
+        self._limpar_sessao()
+        return {"status": "success"}
+
+    def _token_valido(self):
+        if not self.refresh_token:
+            return None
+        if self.id_token and time.time() < self.expira_em:
+            return self.id_token
+        st, corpo = _http_json(
+            f"{TOKEN_URL}?key={self.api_key}",
+            {"grant_type": "refresh_token", "refresh_token": self.refresh_token},
+            method="POST")
+        if st == 200 and isinstance(corpo, dict) and corpo.get("id_token"):
+            self.id_token = corpo["id_token"]
+            self.refresh_token = corpo.get("refresh_token", self.refresh_token)
+            self.uid = corpo.get("user_id", self.uid)
+            try:
+                self.expira_em = time.time() + int(corpo.get("expires_in", 3600)) - 120
+            except Exception:
+                self.expira_em = time.time() + 3300
+            self._salvar_sessao()
+            return self.id_token
+        self.ultimo_erro = _mensagem_amigavel((corpo or {}).get("error", {}).get("message", "TOKEN_EXPIRED"))
+        return None
+
+    def _caminho_dados(self, token):
+        return f"{self.db_url}/apps/{APP_NAMESPACE}/users/{self.uid}/database.json?auth={token}"
+
+    def baixar(self):
+        if not (self.configurado and self.logado):
+            return {"status": "offline", "message": "Nao conectado."}
+        token = self._token_valido()
+        if not token:
+            return {"status": "auth_error", "message": self.ultimo_erro or "Sessao expirada."}
+        st, corpo = _http_json(self._caminho_dados(token), permitir_fallback=True)
+        if st == 200:
+            if corpo is None: return {"status": "empty"}
+            if isinstance(corpo, dict): return {"status": "ok", "data": corpo}
+            return {"status": "error", "message": "Formato inesperado."}
+        if st in (401, 403):
+            return {"status": "auth_error", "message": "Sem permissao."}
+        return {"status": "error", "message": f"HTTP {st}"}
+
+    def enviar(self, dados_dict):
+        if not (self.configurado and self.logado):
+            return {"status": "offline", "message": "Nao conectado."}
+        token = self._token_valido()
+        if not token:
+            return {"status": "auth_error", "message": self.ultimo_erro or "Sessao expirada."}
+        st, corpo = _http_json(self._caminho_dados(token), dados_dict, method="PUT", permitir_fallback=True)
+        if st in (200, 201, 204):
+            return {"status": "success"}
+        return {"status": "error", "message": f"HTTP {st}"}
+
+    def resumo(self):
+        return {
+            "configured": self.configurado,
+            "signedIn": self.logado,
+            "email": self.email,
+            "databaseURL": self.db_url,
+        }
+
+class CogniDesktopAPI:
+    def __init__(self):
+        self._base_dir = os.path.dirname(LOCAL_FALLBACK_PATH)
+        try:
+            os.makedirs(self._base_dir, exist_ok=True)
+            os.makedirs(DOCS_PATH, exist_ok=True)
+        except Exception as e:
+            print(f"[Cogni] Erro na criacao de pastas: {e}")
+
+        self._cloud = CloudSync(self._base_dir)
+        self._ultimo_sync = None
+        self.local_path = LOCAL_FALLBACK_PATH
+        self._updater = AutoUpdater(self._base_dir)
+        self._update_cache = None
+
+        try:
+            import threading
+            threading.Thread(target=self._checar_update_em_background, daemon=True).start()
+        except Exception as e:
+            print(f"[Cogni] Erro na thread de update: {e}")
+
+        self._aplicar_caminhos_do_usuario()
+
+    def _checar_update_em_background(self):
+        try:
+            time.sleep(4)
+            self._update_cache = self._updater.verificar(forcar=True)
+        except Exception as e:
+            self._update_cache = {"status": "error", "message": str(e), "current": APP_VERSION}
+
+    def update_cached(self):
+        return self._update_cache
+
+    def update_check_now(self):
+        try:
+            self._update_cache = self._updater.verificar(forcar=True)
+            return self._update_cache
+        except Exception as e:
+            return {"status": "error", "message": str(e), "current": APP_VERSION}
+
+    def update_install(self):
+        try:
+            return self._updater.baixar_e_aplicar()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def update_progress(self):
+        try:
+            return self._updater.progresso()
+        except Exception as e:
+            return {"fase": "error", "pct": 0, "mensagem": str(e)}
+
+    def update_channel_info(self):
+        return {
+            "channel": UPDATE_CHANNEL,
+            "manifest": UPDATE_MANIFEST_URL.split("?")[0],
+            "tlsVerificavel": _ssl_ctx_strict is not None,
+            "tlsDegradado": _TLS_DEGRADADO,
+            "tlsMotivo": _TLS_MOTIVO,
+            "pasta": self._updater.pasta,
+        }
+
+    def security_status(self):
+        return {
+            "tlsVerificavel": _ssl_ctx_strict is not None,
+            "tlsDegradado": _TLS_DEGRADADO,
+            "motivo": _TLS_MOTIVO,
+            "authSempreVerificado": True,
+        }
+
+    def get_app_version(self):
+        return APP_VERSION
+
+    def get_docs_path(self):
+        return DOCS_PATH
+
+    def open_docs_folder(self):
+        try:
+            os.makedirs(DOCS_PATH, exist_ok=True)
+            os.startfile(DOCS_PATH)
+            return {"status": "success", "path": DOCS_PATH}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def _pasta_do_usuario(self):
+        if self._cloud.logado and self._cloud.uid:
+            return os.path.join(self._base_dir, "users", self._cloud.uid)
+        return os.path.join(self._base_dir, "local")
+
+    def _aplicar_caminhos_do_usuario(self):
+        pasta = self._pasta_do_usuario()
+        try:
+            os.makedirs(pasta, exist_ok=True)
+        except Exception as e:
+            print(f"[Cogni] Falha pasta usuario: {e}")
+        self.local_path = os.path.join(pasta, "database.json")
+        self._ultimo_sync = None
+        self._ensure_local_cache_exists()
+
+    def cloud_status(self):
+        r = self._cloud.resumo()
+        r["lastSync"] = self._ultimo_sync
+        return r
+
+    def cloud_save_config(self, api_key, database_url):
+        return self._cloud.salvar_config(api_key, database_url)
+
+    def cloud_sign_up(self, email, password):
+        r = self._cloud.criar_conta(email, password)
+        if r.get("status") == "success":
+            self._aplicar_caminhos_do_usuario()
+        return r
+
+    def cloud_sign_in(self, email, password):
+        r = self._cloud.entrar(email, password)
+        if r.get("status") == "success":
+            self._aplicar_caminhos_do_usuario()
+        return r
+
+    def cloud_sign_out(self):
+        r = self._cloud.sair()
+        self._aplicar_caminhos_do_usuario()
+        return r
+
+    @staticmethod
+    def _peso(d):
+        try:
+            return (len(d.get("tasks") or []) + len(d.get("notes") or []) +
+                    len(d.get("flashcardDecks") or []) + len(d.get("postits") or []) +
+                    len(d.get("studyLogs") or []) + len(d.get("subjects") or []))
+        except Exception:
+            return 0
+
+    def cloud_legacy_preview(self):
+        d = self._ler_legado()
+        if not d: return {"available": False}
+        return {"available": self._peso(d) > 0, "items": self._peso(d),
+                "tasks": len(d.get("tasks") or []),
+                "subjects": len(d.get("subjects") or []),
+                "notes": len(d.get("notes") or [])}
+
+    def cloud_import_legacy(self):
+        d = self._ler_legado()
+        if not d or self._peso(d) == 0:
+            return {"status": "error", "message": "Nao ha dados antigos para importar."}
+        res = self._cloud.enviar(d)
+        if res.get("status") != "success": return res
+        texto = json.dumps(d, ensure_ascii=False)
+        self._save_local_cache(texto)
+        self._ultimo_sync = time.strftime("%H:%M:%S")
+        return {"status": "success", "data": texto, "items": self._peso(d)}
+
+    def _ler_legado(self):
+        try:
+            token = self._cloud._token_valido()
+            url = LEGACY_URL + (f"?auth={token}" if token else "")
+            st, corpo = _http_json(url, timeout=10, permitir_fallback=True)
+            if st == 200 and isinstance(corpo, dict) and corpo:
+                return corpo
+        except Exception as e:
+            print(f"[Cogni Legado] erro: {e}")
+        return None
+
+    def _ensure_local_cache_exists(self):
+        try:
+            caminho = getattr(self, "local_path", LOCAL_FALLBACK_PATH)
+            os.makedirs(os.path.dirname(caminho), exist_ok=True)
+            if not os.path.exists(caminho):
+                with open(caminho, "w", encoding="utf-8") as f:
+                    f.write("{}")
+        except Exception as e:
+            print(f"[Python Cache] erro: {e}")
+
+    def load_state_from_disk(self):
+        if not (self._cloud.configurado and self._cloud.logado):
+            return self._load_local_cache() or "{}"
+        remoto = self._cloud.baixar()
+        if remoto.get("status") == "ok":
+            dados = remoto["data"]
+            local = self._load_local_cache()
+            try: d_local = json.loads(local) if local else {}
+            except Exception: d_local = {}
+
+            if self._peso(d_local) > self._peso(dados):
+                self._cloud.enviar(d_local)
+                return local
+            texto = json.dumps(dados, ensure_ascii=False)
+            self._save_local_cache(texto)
+            self._ultimo_sync = time.strftime("%H:%M:%S")
+            return texto
+        if remoto.get("status") == "empty":
+            local = self._load_local_cache()
+            if local and local.strip() not in ("null", "{}"):
+                try:
+                    d = json.loads(local)
+                    if self._peso(d) > 0:
+                        self._cloud.enviar(d)
+                        self._ultimo_sync = time.strftime("%H:%M:%S")
+                        return local
+                except Exception: pass
+            return "{}"
+        return self._load_local_cache() or "{}"
+
+    def save_state_to_disk(self, json_str):
+        self._save_local_cache(json_str)
+        if not (self._cloud.configurado and self._cloud.logado):
+            return {"status": "offline_saved", "mode": "local_only", "message": "Sem conta conectada."}
+        try:
+            dados = json.loads(json_str)
+        except Exception as e:
+            return {"status": "error", "message": f"JSON invalido: {e}"}
+        res = self._cloud.enviar(dados)
+        if res.get("status") == "success":
+            self._ultimo_sync = time.strftime("%H:%M:%S")
+            return {"status": "success", "mode": "cloud", "at": self._ultimo_sync}
+        return {"status": "offline_saved", "mode": "local_only", "message": res.get("message", "")}
+
+    def _save_local_cache(self, json_str):
+        self._ensure_local_cache_exists()
+        try:
+            with open(self.local_path, "w", encoding="utf-8") as f:
+                f.write(json_str)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            print(f"[Backup Local] Erro: {e}")
+
+    def _load_local_cache(self):
+        self._ensure_local_cache_exists()
+        if os.path.exists(self.local_path):
+            try:
+                with open(self.local_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    if content.strip() and content.strip() != "null":
+                        return content
+            except Exception as e:
+                print(f"[Backup Local] Erro ao ler: {e}")
+        return None
+
+    EXTENSOES_EXECUTAVEIS = {
+        ".exe", ".com", ".bat", ".cmd", ".ps1", ".psm1", ".vbs", ".vbe",
+        ".js", ".jse", ".wsf", ".wsh", ".msi", ".msp", ".scr", ".pif",
+        ".hta", ".cpl", ".jar", ".reg", ".lnk", ".url", ".inf", ".application",
+        ".gadget", ".msc", ".sct", ".shb", ".shs", ".ws",
+    }
+
+    def open_external_target(self, target_path):
+        try:
+            if not target_path: return {"status": "error", "message": "Caminho nao especificado."}
+            clean_path = str(target_path).strip('"\'')
+            if clean_path.lower().startswith(("http://", "https://")):
+                webbrowser.open(clean_path)
+            elif ":" in clean_path.split("\\")[0].split("/")[0][2:]:
+                return {"status": "error", "message": "Tipo de link nao permitido."}
+            else:
+                norm_path = os.path.normpath(clean_path)
+                ext = os.path.splitext(norm_path)[1].lower()
+                if ext in self.EXTENSOES_EXECUTAVEIS:
+                    return {"status": "error", "message": f"Por seguranca, o Cogni nao abre arquivos '{ext}'."}
+                if os.path.exists(norm_path):
+                    os.startfile(norm_path)
+                else:
+                    return {"status": "error", "message": f"Arquivo nao encontrado: {norm_path}"}
+            return {"status": "success"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def pick_file_native(self):
+        try:
+            window = webview.windows[0]
+            result = window.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=False)
+            if result:
+                file_path = result[0] if isinstance(result, (list, tuple)) else result
+                file_path = os.path.normpath(file_path)
+                file_name = os.path.basename(file_path)
+                file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+                return {"status": "success", "path": file_path, "name": file_name, "size": file_size}
+            return {"status": "cancelled"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def open_pip_timer(self, duration_secs=1500):
+        try:
+            duration_secs = int(duration_secs)
+            pip_html = f"""<!DOCTYPE html>
+            <html lang="pt-BR">
+            <head>
+                <meta charset="UTF-8">
+                <title>Cogni - Timer</title>
+                <meta http-equiv="Content-Security-Policy" content="
+                    default-src 'self';
+                    script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com;
+                    style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com;
+                    font-src 'self' data: https://cdnjs.cloudflare.com;
+                    img-src 'self' data:;
+                    connect-src 'none';
+                    object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none';
+                ">
+                <script src="https://cdn.tailwindcss.com/3.4.5"></script>
+                <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+                <style>
+                    body {{ user-select: none; background: #ffffff; color: #0f172a; overflow: hidden; font-family: sans-serif; }}
+                </style>
+            </head>
+            <body class="h-screen w-screen flex flex-col justify-between p-3 border-2 border-slate-200 rounded-lg bg-white">
+                <div class="flex items-center justify-between text-xs text-slate-900 font-bold border-b border-slate-100 pb-1.5">
+                    <span class="flex items-center gap-1.5"><i class="fa-solid fa-brain text-indigo-600"></i> Cogni Timer</span>
+                    <span id="status-tag" class="bg-slate-50 text-slate-700 text-[10px] px-2 py-0.5 rounded font-mono border border-slate-200">Pronto</span>
+                </div>
+                <div class="my-auto text-center">
+                    <div id="clock" class="font-mono text-4xl font-extrabold text-indigo-600 tracking-wider">00:00</div>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <button id="btn-toggle" onclick="toggleTimer()" class="flex-1 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 shadow-sm">
+                        <i class="fa-solid fa-play" id="btn-icon"></i> <span id="btn-text">Iniciar</span>
+                    </button>
+                    <button onclick="resetTimer()" class="p-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 border border-gray-300 rounded-lg text-xs" title="Resetar">
+                        <i class="fa-solid fa-rotate-left"></i>
+                    </button>
+                </div>
+                <script>
+                    let timerSeconds = {duration_secs};
+                    let initialSecs = {duration_secs};
+                    let isRunning = false;
+                    let timerInterval = null;
+                    function updateDisplay() {{
+                        const m = String(Math.floor(timerSeconds / 60)).padStart(2, '0');
+                        const s = String(timerSeconds % 60).padStart(2, '0');
+                        document.getElementById('clock').innerText = `${{m}}:${{s}}`;
+                    }}
+                    function toggleTimer() {{
+                        if (isRunning) {{
+                            clearInterval(timerInterval);
+                            isRunning = false;
+                            document.getElementById('btn-text').innerText = "Continuar";
+                            document.getElementById('btn-icon').className = "fa-solid fa-play";
+                            document.getElementById('status-tag').innerText = "Pausado";
+                        }} else {{
+                            isRunning = true;
+                            document.getElementById('btn-text').innerText = "Pausar";
+                            document.getElementById('btn-icon').className = "fa-solid fa-pause";
+                            document.getElementById('status-tag').innerText = "Foco";
+                            timerInterval = setInterval(() => {{
+                                if (timerSeconds > 0) {{
+                                    timerSeconds--;
+                                    updateDisplay();
+                                }} else {{
+                                    clearInterval(timerInterval);
+                                    isRunning = false;
+                                    document.getElementById('btn-text').innerText = "Iniciar";
+                                    document.getElementById('btn-icon').className = "fa-solid fa-play";
+                                    document.getElementById('status-tag').innerText = "Concluido";
+                                }}
+                            }}, 1000);
+                        }}
+                    }}
+                    function resetTimer() {{
+                        clearInterval(timerInterval);
+                        isRunning = false;
+                        timerSeconds = initialSecs;
+                        updateDisplay();
+                        document.getElementById('btn-text').innerText = "Iniciar";
+                        document.getElementById('btn-icon').className = "fa-solid fa-play";
+                        document.getElementById('status-tag').innerText = "Pronto";
+                    }}
+                    updateDisplay();
+                </script>
+            </body>
+            </html>"""
+            window = webview.create_window('Cogni - Timer', html=pip_html, width=250, height=155, resizable=False, on_top=True)
+            return {"status": "success"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+HTML_CONTENT = r"""<!DOCTYPE html>
+<html lang="pt-BR" class="h-full bg-white">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cogni - Desktop Study Suite</title>
+    <meta http-equiv="Content-Security-Policy" content="
+        default-src 'self';
+        script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://cdn.jsdelivr.net;
+        style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://fonts.googleapis.com;
+        font-src 'self' data: https://cdnjs.cloudflare.com https://fonts.gstatic.com;
+        img-src 'self' data: blob:;
+        connect-src 'self' https://cogni-data-default-rtdb.firebaseio.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com;
+        object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none';
+    ">
+    <script src="https://cdn.tailwindcss.com/3.4.5"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Inter', 'sans-serif'] },
+                    colors: {
+                        notion: {
+                            bg: '#FFFFFF',
+                            sidebar: '#FBFBFB',
+                            hover: '#F1F1F0',
+                            border: '#E9E9E7',
+                            text: '#37352F',
+                            muted: '#787774',
+                            lightBg: '#F7F6F3'
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        * { -webkit-tap-highlight-color: transparent; }
+        body { user-select: none; -webkit-font-smoothing: antialiased; }
+        .hidden { display: none !important; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #ffffff; }
+        ::-webkit-scrollbar-thumb { background: #e5e7eb; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #d1d5db; }
+        .canvas-area {
+            background-image: radial-gradient(#d1d5db 1px, transparent 1px);
+            background-size: 24px 24px;
+        }
+        .postit-draggable, .pip-draggable { touch-action: none; user-select: none; cursor: grab; }
+        .postit-draggable:active, .pip-draggable:active { cursor: grabbing; }
+        #note-editor-content:empty:before { content: attr(data-placeholder); color: #9ca3af; cursor: text; }
+        #note-editor-content h1 { font-size: 1.625rem; font-weight: 800; margin-top: 0.75rem; margin-bottom: 0.375rem; color: #111827; }
+        #note-editor-content h2 { font-size: 1.35rem; font-weight: 700; margin-top: 0.625rem; margin-bottom: 0.25rem; color: #1f2937; }
+        #note-editor-content h3 { font-size: 1.125rem; font-weight: 600; margin-top: 0.5rem; margin-bottom: 0.25rem; color: #374151; }
+        #note-editor-content ul { list-style-type: disc; padding-left: 1.5rem; margin-top: 0.25rem; margin-bottom: 0.25rem; }
+        #note-editor-content ol { list-style-type: decimal; padding-left: 1.5rem; margin-top: 0.25rem; margin-bottom: 0.25rem; }
+        #note-editor-content p { margin-bottom: 0.375rem; }
+        .perspective-1000 { perspective: 1000px; }
+        .flashcard-inner { position: relative; width: 100%; height: 100%; transition: transform 0.6s cubic-bezier(0.4, 0, 0.2, 1); transform-style: preserve-3d; }
+        .flashcard-inner.is-flipped { transform: rotateY(180deg); }
+        .flashcard-front, .flashcard-back { position: absolute; width: 100%; height: 100%; backface-visibility: hidden; border-radius: 1rem; }
+        .flashcard-back { transform: rotateY(180deg); }
+        .heatmap-cell { transition: transform 0.15s ease, filter 0.15s ease; }
+        .heatmap-cell:hover { transform: scale(1.25); z-index: 10; }
+    </style>
+</head>
+<body class="h-full bg-white text-gray-800 font-sans antialiased flex flex-col overflow-hidden">
+    <!-- TELA DE ENTRADA -->
+    <div id="loginGate" class="fixed inset-0 z-[70] bg-white hidden items-center justify-center p-6">
+        <div class="w-full max-w-sm">
+            <div class="flex items-center gap-3 mb-6 justify-center">
+                <div class="w-10 h-10 rounded-xl accent-bg-badge flex items-center justify-center">
+                    <i class="fa-solid fa-brain text-white text-lg"></i>
+                </div>
+                <div>
+                    <div class="font-bold text-lg text-gray-900 tracking-tight leading-none">Cogni</div>
+                    <div class="text-[11px] text-gray-500">Entre para sincronizar seus estudos</div>
+                </div>
+            </div>
+            <div class="bg-white border border-gray-200 rounded-xl shadow-sm p-5 space-y-3">
+                <input type="email" id="gateEmail" placeholder="seu@email.com" autocomplete="username"
+                       class="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-lg text-sm text-gray-800 focus:outline-none focus:border-gray-400">
+                <input type="password" id="gatePassword" placeholder="Senha (minimo 6 caracteres)" autocomplete="current-password"
+                       class="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-lg text-sm text-gray-800 focus:outline-none focus:border-gray-400">
+                <div id="gateError" class="hidden text-[12px] text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2"></div>
+                <button id="gateSignIn" onclick="gateEntrar()"
+                        class="w-full px-3 py-2.5 rounded-lg text-sm font-bold accent-bg-badge text-white hover:opacity-90 cursor-pointer transition">
+                    Entrar
+                </button>
+                <button id="gateSignUp" onclick="gateCriarConta()"
+                        class="w-full px-3 py-2 rounded-lg text-sm bg-gray-100 border border-gray-200 text-gray-700 hover:bg-gray-200 cursor-pointer transition">
+                    Criar uma conta
+                </button>
+            </div>
+            <p class="text-[11px] text-gray-400 text-center mt-4 leading-relaxed">
+                Seus dados ficam isolados na sua conta.<br>Use o mesmo login em outros computadores para sincronizar.
+            </p>
+        </div>
+    </div>
+
+    <!-- HEADER TOPBAR -->
+    <header class="h-9 bg-notion-sidebar border-b border-notion-border flex items-center justify-between px-3 text-xs text-notion-muted shrink-0 z-20">
+        <div class="flex items-center space-x-2">
+            <div class="flex items-center space-x-2 font-semibold text-gray-800">
+                <i class="fa-solid fa-brain text-black text-sm"></i>
+                <span class="font-bold tracking-tight text-gray-900">Cogni</span>
+                <span id="app-version-badge" class="accent-bg-badge text-white text-[10px] px-1.5 py-0.5 rounded font-semibold cursor-pointer" onclick="openUpdateModal()" title="Clique para verificar atualizacoes">v4.5.1</span>
+            </div>
+            <!-- Update Notification Indicator -->
+            <div id="update-topbar-indicator" class="hidden items-center gap-1.5 bg-amber-100 border border-amber-300 text-amber-900 px-2 py-0.5 rounded text-[10px] font-bold cursor-pointer hover:bg-amber-200 transition" onclick="openUpdateModal()">
+                <i class="fa-solid fa-circle-arrow-up text-amber-600 animate-pulse"></i>
+                <span id="update-topbar-text">Nova Atualizacao</span>
+            </div>
+        </div>
+
+        <div class="flex items-center space-x-2 bg-white px-2.5 py-1 rounded border border-notion-border text-[11px] shadow-sm" id="cloudStatusBar" title="Banco de dados na nuvem">
+            <span class="w-2 h-2 rounded-full bg-gray-300" id="save-dot"></span>
+            <span class="text-gray-600 font-mono truncate max-w-[240px] sm:max-w-none flex items-center gap-1.5">
+                <i class="fa-solid fa-cloud text-indigo-600" id="cloud-status-icon"></i>
+                <span id="cloud-db-name">Firebase</span>
+            </span>
+            <span class="text-gray-400 font-sans" id="last-save-time">  Conectando...</span>
+        </div>
+        <div class="flex items-center space-x-2 text-xs text-gray-400">
+            <button onclick="openUpdateModal()" class="hover:text-gray-700 text-[11px] font-medium flex items-center gap-1 bg-gray-100 hover:bg-gray-200 px-2 py-0.5 rounded border border-gray-200" title="Verificar atualizacoes do aplicativo">
+                <i class="fa-solid fa-arrows-rotate text-indigo-600"></i> Atualizacoes
+            </button>
+        </div>
+    </header>
+
+    <div class="flex-1 flex overflow-hidden relative">
+        <!-- SIDEBAR -->
+        <aside class="w-64 bg-notion-sidebar border-r border-notion-border flex flex-col justify-between shrink-0 select-none z-10">
+            <div class="p-3 space-y-4 overflow-y-auto">
+                <div class="p-2.5 bg-white rounded-lg border border-notion-border shadow-sm flex items-center justify-between group hover:border-indigo-300 cursor-pointer" onclick="openProfileModal()" title="Personalizar Perfil">
+                    <div class="flex items-center space-x-2.5 truncate">
+                        <div id="user-avatar-container" class="shrink-0"></div>
+                        <div class="truncate">
+                            <p class="text-xs font-bold text-gray-900 truncate" id="user-profile-name">Estudante Cogni</p>
+                            <p class="text-[10px] text-notion-muted truncate" id="user-profile-role">Graduacao & Concursos</p>
+                        </div>
+                    </div>
+                    <button type="button" class="text-notion-muted hover:text-indigo-600 p-1 rounded text-xs"><i class="fa-solid fa-user-gear"></i></button>
+                </div>
+                <div class="space-y-0.5">
+                    <div class="text-[10px] font-semibold text-notion-muted uppercase tracking-wider px-2 mb-1">Menu Principal</div>
+                    <button onclick="switchTab('dashboard')" id="nav-dashboard" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-1.5 rounded text-xs font-medium text-gray-700 hover:bg-notion-hover transition bg-notion-hover">
+                        <i class="fa-solid fa-chart-pie w-4 text-center accent-icon-color"></i>
+                        <span>Dashboard de Estudos</span>
+                    </button>
+                    <button onclick="filterBySubject('ALL')" id="nav-tasks" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-1.5 rounded text-xs font-medium text-gray-700 hover:bg-notion-hover transition">
+                        <i class="fa-solid fa-list-check w-4 text-center text-emerald-500"></i>
+                        <span>Tarefas & Projetos</span>
+                        <span id="pending-count-badge" class="ml-auto bg-gray-200 text-gray-700 text-[10px] px-1.5 py-0.2 rounded-full font-bold">0</span>
+                    </button>
+                    <button onclick="switchTab('flashcards')" id="nav-flashcards" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-1.5 rounded text-xs font-medium text-gray-700 hover:bg-notion-hover transition">
+                        <i class="fa-solid fa-layer-group w-4 text-center text-purple-500"></i>
+                        <span>Flashcards</span>
+                        <span id="decks-count-badge" class="ml-auto bg-purple-100 text-purple-800 text-[10px] px-1.5 py-0.2 rounded-full font-bold">0</span>
+                    </button>
+                    <button onclick="switchTab('notes')" id="nav-notes" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-1.5 rounded text-xs font-medium text-gray-700 hover:bg-notion-hover transition">
+                        <i class="fa-solid fa-book-open w-4 text-center text-amber-500"></i>
+                        <span>Caderno de Notas</span>
+                    </button>
+                    <button onclick="switchTab('postits')" id="nav-postits" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-1.5 rounded text-xs font-medium text-gray-700 hover:bg-notion-hover transition">
+                        <i class="fa-solid fa-note-sticky w-4 text-center text-rose-500"></i>
+                        <span>Mural de Post-its</span>
+                    </button>
+                    <button onclick="switchTab('resources')" id="nav-resources" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-1.5 rounded text-xs font-medium text-gray-700 hover:bg-notion-hover transition">
+                        <i class="fa-solid fa-paperclip w-4 text-center text-blue-500"></i>
+                        <span>Central de Anexos</span>
+                    </button>
+                </div>
+                <div class="space-y-1.5 pt-3 border-t border-notion-border">
+                    <div class="flex items-center justify-between px-2 mb-1">
+                        <span class="text-[10px] font-semibold text-notion-muted uppercase tracking-wider">Materia Ativas</span>
+                        <div class="flex items-center space-x-1">
+                            <button onclick="deleteSelectedSubjects()" id="btn-bulk-delete-subjects" class="hidden text-xs text-red-600 hover:bg-red-50 p-0.5 rounded" title="Excluir Materias Selecionadas">
+                                <i class="fa-solid fa-trash-can"></i>
+                            </button>
+                            <button onclick="openSubjectModal()" class="text-xs accent-text-color hover:underline p-0.5"><i class="fa-solid fa-plus"></i> Nova</button>
+                        </div>
+                    </div>
+                    <div id="subject-list" class="space-y-1.5"></div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- MAIN VIEW AREA -->
+        <main class="flex-1 bg-white overflow-y-auto relative flex flex-col min-w-0">
+            <!-- VIEW DASHBOARD -->
+            <section id="view-dashboard" class="view-content p-6 md:p-8 max-w-6xl mx-auto w-full space-y-6">
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between border-b border-notion-border pb-4 gap-4">
+                    <div>
+                        <h1 class="text-2xl font-bold text-gray-900 tracking-tight">Visao Geral de Estudos</h1>
+                        <p class="text-sm text-notion-muted mt-0.5">Acompanhamento de desempenho da semana e do mes atual.</p>
+                    </div>
+                    <div class="flex flex-wrap space-x-2">
+                        <button onclick="openFocusTimerModal()" class="accent-btn-bg hover:opacity-90 text-white text-xs px-3 py-2 rounded-md font-medium transition flex items-center space-x-1.5 shadow-sm">
+                            <i class="fa-solid fa-stopwatch"></i>
+                            <span>Timer de Foco</span>
+                        </button>
+                        <button onclick="openNewTaskModal()" class="bg-gray-900 hover:bg-black text-white text-xs px-3 py-2 rounded-md font-medium transition flex items-center space-x-1.5 shadow-sm">
+                            <i class="fa-solid fa-plus"></i>
+                            <span>Nova Tarefa</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- TOP KPIS -->
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div class="p-4 rounded-lg border border-notion-border bg-white shadow-sm">
+                        <div class="flex items-center justify-between text-notion-muted text-xs">
+                            <span class="font-medium">Tarefas Concluidas</span>
+                            <i class="fa-solid fa-circle-check text-emerald-500"></i>
+                        </div>
+                        <div class="mt-2 flex items-baseline justify-between">
+                            <span class="text-2xl font-bold text-gray-900" id="kpi-completed-tasks">0/0</span>
+                            <span class="text-xs font-semibold text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded" id="kpi-completion-rate">0%</span>
+                        </div>
+                    </div>
+                    <div class="p-4 rounded-lg border border-notion-border bg-white shadow-sm cursor-pointer hover:border-indigo-300 transition" onclick="openFocusTimerModal()">
+                        <div class="flex items-center justify-between text-notion-muted text-xs">
+                            <span class="font-medium">Horas na Semana</span>
+                            <i class="fa-solid fa-clock accent-icon-color"></i>
+                        </div>
+                        <div class="mt-2 flex items-baseline justify-between">
+                            <span class="text-2xl font-bold text-gray-900" id="kpi-focus-hours">0.0 h</span>
+                            <span class="text-xs accent-text-color font-medium" id="kpi-focus-hours-sub">Semana Atual</span>
+                        </div>
+                    </div>
+                    <div class="p-4 rounded-lg border border-notion-border bg-white shadow-sm cursor-pointer hover:border-purple-300 transition" onclick="switchTab('flashcards')">
+                        <div class="flex items-center justify-between text-notion-muted text-xs">
+                            <span class="font-medium">Flashcards Retidos</span>
+                            <i class="fa-solid fa-brain text-purple-500"></i>
+                        </div>
+                        <div class="mt-2 flex items-baseline justify-between">
+                            <span class="text-2xl font-bold text-purple-900" id="kpi-flashcards-mastered">0/0</span>
+                            <span class="text-xs text-purple-600 bg-purple-50 px-1.5 py-0.5 rounded font-medium" id="kpi-flashcards-rate">0% dominados</span>
+                        </div>
+                    </div>
+                    <div class="p-4 rounded-lg border border-notion-border bg-white shadow-sm">
+                        <div class="flex items-center justify-between text-notion-muted text-xs">
+                            <span class="font-medium">Notas Cadastradas</span>
+                            <i class="fa-solid fa-file-lines text-amber-500"></i>
+                        </div>
+                        <div class="mt-2 flex items-baseline justify-between">
+                            <span class="text-2xl font-bold text-gray-900" id="kpi-notes-count">0</span>
+                            <span class="text-xs text-notion-muted">Caderno</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="border border-notion-border rounded-lg bg-white p-5 shadow-sm space-y-3">
+                    <div class="flex items-center justify-between">
+                        <h3 class="text-sm font-semibold text-gray-800 flex items-center gap-2">
+                            <i class="fa-solid fa-graduation-cap accent-icon-color"></i> Progresso por Materia (% de Tarefas & Etapas)
+                        </h3>
+                    </div>
+                    <div id="dashboard-subject-progress-list" class="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1"></div>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <div class="p-5 border border-notion-border rounded-lg bg-white shadow-sm">
+                        <div class="flex items-center justify-between mb-4">
+                            <h3 class="text-sm font-semibold text-gray-800 flex items-center gap-2">
+                                <i class="fa-solid fa-chart-column accent-icon-color"></i> Horas Dedicadas na Semana
+                            </h3>
+                            <span class="text-[11px] font-mono font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded" id="weekly-chart-range-label">Semana Atual</span>
+                        </div>
+                        <div class="h-56">
+                            <canvas id="studyHoursChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="p-5 border border-notion-border rounded-lg bg-white shadow-sm flex flex-col">
+                        <h3 class="text-sm font-semibold text-gray-800 mb-4 flex items-center gap-2">
+                            <i class="fa-solid fa-chart-pie text-emerald-500"></i> Distribuicao de Tarefas por Materia
+                        </h3>
+                        <div class="h-56 flex-1 relative flex items-center justify-center">
+                            <canvas id="subjectsChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="p-5 border border-notion-border rounded-xl bg-white shadow-sm space-y-4">
+                    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-notion-border pb-3">
+                        <div>
+                            <h3 class="text-sm font-bold text-gray-900 flex items-center gap-2">
+                                <i class="fa-solid fa-fire text-amber-500"></i>
+                                <span>Matriz de Consistencia e Foco do Mes</span>
+                            </h3>
+                            <p class="text-xs text-notion-muted mt-0.5" id="monthly-heatmap-sublabel">Historico diario de estudo no mes atual</p>
+                        </div>
+                        <div class="flex items-center space-x-3 text-xs">
+                            <span class="bg-gray-100 text-gray-700 px-2.5 py-1 rounded-md font-bold" id="monthly-total-hours-badge">0.0 h no mes</span>
+                            <span class="bg-amber-50 text-amber-800 border border-amber-200 px-2.5 py-1 rounded-md font-bold" id="monthly-streak-badge">Sequencia: 0 dias</span>
+                        </div>
+                    </div>
+                    <div class="space-y-2">
+                        <div id="monthly-heatmap-grid" class="flex flex-wrap gap-1.5 pt-2 pb-1 justify-start"></div>
+                        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-[11px] text-notion-muted pt-2 border-t border-notion-border">
+                            <div class="flex items-center space-x-2" id="monthly-heatmap-legend">
+                                <span>Menos</span>
+                                <div class="w-3.5 h-3.5 rounded bg-gray-100 border border-gray-200" title="Sem estudo (0h)"></div>
+                                <div class="w-3.5 h-3.5 rounded bg-indigo-100 border border-indigo-200" title="Foco leve (< 1h)"></div>
+                                <div class="w-3.5 h-3.5 rounded bg-indigo-300 border border-indigo-400" title="Foco moderado (1h - 2.5h)"></div>
+                                <div class="w-3.5 h-3.5 rounded bg-indigo-500 border border-indigo-600" title="Foco intenso (2.5h - 4h)"></div>
+                                <div class="w-3.5 h-3.5 rounded bg-indigo-700 border border-indigo-800" title="Foco extremo (> 4h)"></div>
+                                <span>Mais</span>
+                            </div>
+                            <span id="monthly-active-days-summary" class="font-medium text-gray-700">0 dias ativos neste mes</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- VIEW TASKS -->
+            <section id="view-tasks" class="view-content hidden p-6 md:p-8 max-w-6xl mx-auto w-full space-y-6">
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between border-b border-notion-border pb-4 gap-3">
+                    <div>
+                        <h1 class="text-2xl font-bold text-gray-900 tracking-tight flex items-center gap-2">
+                            <span>Tarefas & Projetos</span>
+                            <span id="active-subject-filter-badge" class="hidden accent-bg-badge text-white text-xs px-2.5 py-1 rounded-full font-bold"></span>
+                        </h1>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <div class="flex items-center bg-gray-100 p-0.5 rounded-lg border border-notion-border text-xs">
+                            <button id="view-mode-table-btn" onclick="setTasksViewMode('table')" class="px-2.5 py-1 rounded font-bold bg-white accent-text-color shadow-2xs">Tabela</button>
+                            <button id="view-mode-kanban-btn" onclick="setTasksViewMode('kanban')" class="px-2.5 py-1 rounded font-bold text-gray-600 hover:text-gray-900">Kanban</button>
+                        </div>
+                        <button onclick="deleteSelectedTasks()" id="btn-bulk-delete-tasks" class="hidden bg-red-600 hover:bg-red-700 text-white text-xs px-3 py-2 rounded-md font-medium shadow-sm">
+                            <i class="fa-solid fa-trash mr-1"></i> Excluir Selecionadas (<span id="selected-tasks-count">0</span>)
+                        </button>
+                        <button onclick="filterBySubject('ALL')" id="btn-clear-subject-filter" class="hidden text-xs bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 rounded-md font-medium">
+                            Mostrar Todas
+                        </button>
+                        <button onclick="openNewTaskModal()" class="bg-gray-900 hover:bg-black text-white text-xs px-3 py-2 rounded-md font-medium flex items-center space-x-1.5 shadow-sm">
+                            <i class="fa-solid fa-plus"></i>
+                            <span>Adicionar Tarefa</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="flex flex-wrap items-center justify-between gap-3 bg-notion-lightBg p-3 rounded-lg border border-notion-border">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <span class="text-xs font-medium text-notion-muted">Materia:</span>
+                        <select id="filter-subject" onchange="filterBySubject(this.value)" class="text-xs border border-notion-border rounded px-2 py-1.5 bg-white text-gray-700 focus:outline-none">
+                            <option value="ALL">Todas as Materias</option>
+                        </select>
+                        <select id="filter-priority" onchange="renderTasks()" class="text-xs border border-notion-border rounded px-2 py-1.5 bg-white text-gray-700 focus:outline-none">
+                            <option value="ALL">Todas as Prioridades</option>
+                            <option value="Alta">Alta Prioridade</option>
+                            <option value="Media">Media Prioridade</option>
+                            <option value="Baixa">Baixa Prioridade</option>
+                        </select>
+                    </div>
+                    <input type="text" id="search-tasks" oninput="renderTasks()" placeholder="Buscar tarefa..." class="px-3 py-1.5 border border-notion-border rounded text-xs bg-white text-gray-800 focus:outline-none w-full sm:w-56">
+                </div>
+
+                <div id="tasks-table-container" class="border border-notion-border rounded-lg overflow-hidden bg-white shadow-sm">
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left text-xs text-gray-700">
+                            <thead class="bg-notion-sidebar border-b border-notion-border text-notion-muted font-semibold">
+                                <tr>
+                                    <th class="py-3 px-3 w-8 text-center">
+                                        <input type="checkbox" id="select-all-tasks" onchange="toggleSelectAllTasks(this)" class="rounded border-gray-300 accent-text-color focus:ring-0 cursor-pointer">
+                                    </th>
+                                    <th class="py-3 px-3 w-8 text-center">Icone</th>
+                                    <th class="py-3 px-4 min-w-[200px]">Titulo da Tarefa</th>
+                                    <th class="py-3 px-4">Materia</th>
+                                    <th class="py-3 px-4 min-w-[130px]">Progresso</th>
+                                    <th class="py-3 px-4">Status</th>
+                                    <th class="py-3 px-4">Data Limite</th>
+                                    <th class="py-3 px-4 text-right">Acoes</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tasks-table-body" class="divide-y divide-notion-border"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div id="completed-tasks-wrapper" class="hidden border border-emerald-200 bg-emerald-50/30 rounded-lg p-4 space-y-3">
+                    <button onclick="toggleCompletedTasksSection()" class="flex items-center justify-between w-full text-xs font-bold text-emerald-900">
+                        <span class="flex items-center gap-2">
+                            <i class="fa-solid fa-circle-check text-emerald-600"></i>
+                            <span>Tarefas Concluidas (<span id="completed-tasks-count-label">0</span>)</span>
+                        </span>
+                        <i id="completed-chevron-icon" class="fa-solid fa-chevron-down"></i>
+                    </button>
+                    <div id="completed-tasks-container" class="space-y-2 pt-2 border-t border-emerald-200/60 hidden"></div>
+                </div>
+
+                <div id="tasks-kanban-container" class="hidden grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div class="bg-gray-50 border border-notion-border rounded-xl p-3 space-y-3">
+                        <div class="flex items-center justify-between text-xs font-bold text-gray-700 pb-2 border-b">
+                            <span>A Fazer</span>
+                            <span id="kanban-todo-count" class="bg-gray-200 text-gray-800 px-2 py-0.5 rounded-full text-[10px]">0</span>
+                        </div>
+                        <div id="kanban-col-todo" class="space-y-2 min-h-[150px]"></div>
+                    </div>
+                    <div class="bg-blue-50/40 border border-blue-200 rounded-xl p-3 space-y-3">
+                        <div class="flex items-center justify-between text-xs font-bold text-blue-900 pb-2 border-b border-blue-200">
+                            <span>Em Andamento</span>
+                            <span id="kanban-doing-count" class="bg-blue-200 text-blue-900 px-2 py-0.5 rounded-full text-[10px]">0</span>
+                        </div>
+                        <div id="kanban-col-doing" class="space-y-2 min-h-[150px]"></div>
+                    </div>
+                    <div class="bg-emerald-50/40 border border-emerald-200 rounded-xl p-3 space-y-3">
+                        <div class="flex items-center justify-between text-xs font-bold text-emerald-900 pb-2 border-b border-emerald-200">
+                            <span>Concluido</span>
+                            <span id="kanban-done-count" class="bg-emerald-200 text-emerald-900 px-2 py-0.5 rounded-full text-[10px]">0</span>
+                        </div>
+                        <div id="kanban-col-done" class="space-y-2 min-h-[150px]"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- VIEW NOTES -->
+            <section id="view-notes" class="view-content hidden flex-1 flex h-full">
+                <div class="w-64 border-r border-notion-border bg-notion-sidebar flex flex-col shrink-0">
+                    <div class="p-3 border-b border-notion-border flex items-center justify-between">
+                        <span class="text-xs font-semibold text-gray-700 flex items-center gap-1.5">
+                            <i class="fa-solid fa-book-bookmark text-amber-500"></i> Suas Notas
+                        </span>
+                        <div class="flex items-center space-x-1">
+                            <button onclick="deleteSelectedNotes()" id="btn-bulk-delete-notes" class="hidden text-xs text-red-600 hover:bg-red-50 p-1 rounded" title="Excluir Selecionadas">
+                                <i class="fa-solid fa-trash"></i>
+                            </button>
+                            <button onclick="createNewNote()" class="text-xs bg-white hover:bg-gray-100 border border-notion-border px-2 py-1 rounded shadow-sm text-gray-700 transition">
+                                <i class="fa-solid fa-plus mr-1"></i> Nova
+                            </button>
+                        </div>
+                    </div>
+                    <div id="notes-sidebar-list" class="p-2 space-y-1 overflow-y-auto flex-1"></div>
+                </div>
+                <div class="flex-1 flex flex-col bg-white overflow-y-auto p-8">
+                    <div class="max-w-3xl mx-auto w-full space-y-5">
+                        <div class="flex items-center justify-between border-b border-notion-border pb-3">
+                            <div class="flex items-center space-x-2 text-xs">
+                                <span class="text-notion-muted font-medium">Materia:</span>
+                                <select id="note-subject-select" onchange="updateNoteSubject(this.value)" class="bg-gray-100 border border-notion-border px-2 py-0.5 rounded font-semibold focus:outline-none cursor-pointer"></select>
+                            </div>
+                            <button onclick="deleteCurrentNote()" class="text-xs text-red-500 hover:text-red-700 px-2 py-1 rounded hover:bg-red-50">
+                                <i class="fa-solid fa-trash mr-1"></i> Excluir Nota
+                            </button>
+                        </div>
+                        <input type="text" id="note-editor-title" oninput="updateCurrentNote()" placeholder="Titulo da anotacao..." class="w-full text-3xl font-bold text-gray-900 border-none outline-none placeholder-gray-300 bg-transparent">
+                        <div class="p-3 bg-notion-lightBg border border-notion-border rounded-lg space-y-2">
+                            <div class="flex items-center justify-between text-xs font-semibold text-gray-700">
+                                <span class="flex items-center gap-1.5"><i class="fa-solid fa-paperclip accent-icon-color"></i> Anexos & Links</span>
+                                <div class="flex space-x-2 text-[11px]">
+                                    <button type="button" onclick="addLinkToNote()" class="accent-text-color hover:underline">+ Adicionar Link</button>
+                                    <button type="button" onclick="attachFileToNote()" class="text-rose-600 hover:underline">+ Anexar Arquivo</button>
+                                </div>
+                            </div>
+                            <div id="note-resources-list" class="flex flex-wrap gap-2 text-xs pt-1"></div>
+                        </div>
+                        <div class="sticky top-0 z-20 flex flex-wrap items-center gap-1.5 p-2 bg-notion-lightBg border border-notion-border rounded-lg text-xs shadow-sm">
+                            <button type="button" onclick="execDocCmd('bold')" title="Negrito" class="w-7 h-7 bg-white border rounded font-bold flex items-center justify-center">B</button>
+                            <button type="button" onclick="execDocCmd('italic')" title="Italico" class="w-7 h-7 bg-white border rounded italic flex items-center justify-center">I</button>
+                            <button type="button" onclick="execDocCmd('underline')" title="Sublinhado" class="w-7 h-7 bg-white border rounded underline flex items-center justify-center">U</button>
+                            <div class="h-4 w-px bg-gray-300 mx-0.5"></div>
+                            <button type="button" onclick="execDocCmd('insertUnorderedList')" title="Lista Marcadores" class="w-7 h-7 bg-white border rounded flex items-center justify-center"><i class="fa-solid fa-list-ul"></i></button>
+                            <button type="button" onclick="execDocCmd('insertOrderedList')" title="Lista Numerada" class="w-7 h-7 bg-white border rounded flex items-center justify-center"><i class="fa-solid fa-list-ol"></i></button>
+                            <div class="h-4 w-px bg-gray-300 mx-0.5"></div>
+                            <button type="button" onclick="execDocCmd('foreColor', '#dc2626')" class="w-4 h-4 rounded-full bg-red-600"></button>
+                            <button type="button" onclick="execDocCmd('foreColor', '#2563eb')" class="w-4 h-4 rounded-full bg-blue-600"></button>
+                            <button type="button" onclick="execDocCmd('foreColor', '#16a34a')" class="w-4 h-4 rounded-full bg-green-600"></button>
+                            <button type="button" onclick="execDocCmd('hiliteColor', '#fef08a')" class="w-4 h-4 rounded-full bg-yellow-300 border" title="Marca-Texto Amarelo"></button>
+                            <button type="button" onclick="execDocCmd('hiliteColor', '#bbf7d0')" class="w-4 h-4 rounded-full bg-emerald-300 border" title="Marca-Texto Verde"></button>
+                            <button type="button" onclick="execDocCmd('hiliteColor', '#bfdbfe')" class="w-4 h-4 rounded-full bg-blue-300 border" title="Marca-Texto Azul"></button>
+                            <button type="button" onclick="clearFormattingCmd()" class="ml-auto text-[11px] text-rose-600 font-bold px-2 py-1 bg-white border rounded">Limpar</button>
+                        </div>
+                        <div id="note-editor-content"
+                              contenteditable="true"
+                              oninput="updateCurrentNote()"
+                              data-placeholder="Digite suas anotacoes aqui..."
+                              class="w-full min-h-[350px] border border-notion-border rounded-lg p-5 outline-none text-sm leading-relaxed bg-white font-sans overflow-y-auto"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- VIEW POSTITS CANVAS -->
+            <section id="view-postits" class="view-content hidden flex-1 flex flex-col h-full overflow-hidden">
+                <div class="h-12 border-b border-notion-border px-6 flex items-center justify-between bg-white shrink-0">
+                    <h2 class="text-sm font-bold text-gray-800 flex items-center gap-1.5">
+                        <span>Mural de Post-its (Canvas)</span>
+                    </h2>
+                    <div class="flex items-center space-x-2">
+                        <button onclick="organizePostitsBySubject()" class="accent-btn-bg hover:opacity-90 text-white text-xs px-3 py-1.5 rounded-md font-medium transition flex items-center space-x-1.5 shadow-sm">
+                            <i class="fa-solid fa-diagram-project"></i>
+                            <span>Organizar por Materia</span>
+                        </button>
+                        <button onclick="createNewPostit()" class="bg-rose-500 hover:bg-rose-600 text-white text-xs px-3 py-1.5 rounded-md font-medium shadow-sm">
+                            + Novo Post-it
+                        </button>
+                    </div>
+                </div>
+                <div id="canvas-container" class="flex-1 canvas-area relative overflow-auto p-6 min-h-[700px]"></div>
+            </section>
+
+            <!-- VIEW FLASHCARDS -->
+            <section id="view-flashcards" class="view-content hidden p-6 md:p-8 max-w-6xl mx-auto w-full space-y-6">
+                <div class="flex items-center justify-between border-b pb-4">
+                    <h1 class="text-2xl font-bold text-gray-900">Baralhos de Flashcards</h1>
+                    <div class="flex items-center space-x-2">
+                        <button onclick="deleteSelectedDecks()" id="btn-bulk-delete-decks" class="hidden bg-red-600 hover:bg-red-700 text-white text-xs px-3 py-2 rounded-md font-medium shadow-sm">
+                            <i class="fa-solid fa-trash mr-1"></i> Excluir Selecionados (<span id="selected-decks-count">0</span>)
+                        </button>
+                        <button onclick="openDeckEditorModal()" class="accent-btn-bg hover:opacity-90 text-white text-xs px-3 py-2 rounded-md font-bold shadow-sm">+ Criar Baralho</button>
+                    </div>
+                </div>
+                <div id="flashcard-decks-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5"></div>
+            </section>
+
+            <!-- VIEW CENTRAL RESOURCES -->
+            <section id="view-resources" class="view-content hidden p-6 md:p-8 max-w-6xl mx-auto w-full space-y-6">
+                <h1 class="text-2xl font-bold text-gray-900 border-b pb-4">Central de Anexos & Links</h1>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div class="border rounded-lg p-5 bg-white shadow-sm space-y-3">
+                        <h3 class="text-sm font-semibold border-b pb-2 flex items-center gap-2"><i class="fa-solid fa-globe text-blue-500"></i> Links & Videoaulas</h3>
+                        <div id="all-links-list" class="space-y-2 text-xs"></div>
+                    </div>
+                    <div class="border rounded-lg p-5 bg-white shadow-sm space-y-3">
+                        <h3 class="text-sm font-semibold border-b pb-2 flex items-center gap-2"><i class="fa-solid fa-file-pdf text-rose-500"></i> Arquivos do Computador</h3>
+                        <div id="all-files-list" class="space-y-2 text-xs"></div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- MODAL ATUALIZACAO AUTOMATICA -->
+    <div id="update-modal" class="fixed inset-0 bg-black/40 backdrop-blur-sm hidden flex items-center justify-center z-50 p-4">
+        <div class="bg-white rounded-xl border border-notion-border shadow-2xl w-full max-w-md overflow-hidden flex flex-col text-xs my-auto">
+            <div class="p-4 border-b border-notion-border flex items-center justify-between bg-notion-sidebar">
+                <h3 class="text-sm font-bold text-gray-800 flex items-center gap-2">
+                    <i class="fa-solid fa-arrows-rotate text-indigo-600"></i>
+                    <span>Atualizacao do Cogni</span>
+                </h3>
+                <button type="button" onclick="closeModal('update-modal')" class="text-notion-muted hover:text-gray-800"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="p-5 space-y-4">
+                <div id="update-modal-body">
+                    <p class="text-gray-600 text-xs">Consultando atualizacoes disponiveis...</p>
+                </div>
+                <div id="update-progress-box" class="hidden space-y-2 pt-2 border-t border-gray-100">
+                    <div class="flex justify-between items-center text-[11px] font-semibold text-gray-700">
+                        <span id="update-progress-label">Baixando atualizacao...</span>
+                        <span id="update-progress-pct" class="font-mono text-indigo-600">0%</span>
+                    </div>
+                    <div class="w-full bg-gray-200 h-2 rounded-full overflow-hidden">
+                        <div id="update-progress-bar" class="bg-indigo-600 h-2 rounded-full transition-all duration-300" style="width: 0%"></div>
+                    </div>
+                    <p id="update-progress-submsg" class="text-[10px] text-gray-500 font-mono truncate"></p>
+                </div>
+                <div class="pt-3 border-t flex justify-between items-center">
+                    <button type="button" onclick="checkUpdateManual()" class="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 border rounded font-medium transition text-gray-700">
+                        <i class="fa-solid fa-rotate mr-1"></i> Verificar Agora
+                    </button>
+                    <div class="flex space-x-2">
+                        <button type="button" onclick="closeModal('update-modal')" class="px-3 py-1.5 border rounded">Fechar</button>
+                        <button type="button" id="btn-install-update-now" onclick="installUpdateNow()" class="hidden px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded shadow-sm transition">
+                            Atualizar Agora
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <style id="accent-theme-styles">
+        .accent-text-color { color: #4f46e5; }
+        .accent-bg-badge { background-color: #4f46e5; }
+        .accent-btn-bg { background-color: #4f46e5; }
+        .accent-icon-color { color: #4f46e5; }
+        .accent-border-color { border-color: #c7d2fe; }
+        .accent-light-bg { background-color: #eef2ff; }
+    </style>
+
+    <script>
+        const DEVOPS_ICONS = [
+            { id: 'fa-solid fa-book', label: 'Livro' },
+            { id: 'fa-solid fa-graduation-cap', label: 'Graduacao' },
+            { id: 'fa-solid fa-pen-nib', label: 'Redacao' },
+            { id: 'fa-solid fa-calculator', label: 'Calculo' },
+            { id: 'fa-solid fa-flask', label: 'Laboratorio' },
+            { id: 'fa-solid fa-microscope', label: 'Pesquisa' },
+            { id: 'fa-solid fa-compass', label: 'Geografia' },
+            { id: 'fa-solid fa-brain', label: 'Conhecimento' },
+            { id: 'fa-solid fa-briefcase', label: 'Gestao' },
+            { id: 'fa-solid fa-chart-line', label: 'Financas' },
+            { id: 'fa-solid fa-sitemap', label: 'Organograma' },
+            { id: 'fa-solid fa-handshake', label: 'Negocios' },
+            { id: 'fa-solid fa-coins', label: 'Economia' },
+            { id: 'fa-solid fa-bullseye', label: 'Metas / KPIs' },
+            { id: 'fa-solid fa-users-gear', label: 'RH' },
+            { id: 'fa-solid fa-boxes-stacked', label: 'Logistica' }
+        ];
+        let appData = {
+            userProfile: { name: '', role: '', avatarPhoto: '' },
+            accentTheme: 'indigo',
+            subjects: [],
+            selectedSubjectIdsForDelete: [],
+            tasks: [],
+            selectedTaskIds: [],
+            flashcardDecks: [],
+            selectedDeckIds: [],
+            notes: [],
+            selectedNoteIds: [],
+            postits: [],
+            studyLogs: []
+        };
+        const THEME_PALETTES = {
+            indigo: { text: '#4f46e5', bg: '#4f46e5', border: '#c7d2fe', light: '#eef2ff', chartPalette: ['#4f46e5', '#06b6d4', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#64748b'] },
+            rose: { text: '#e11d48', bg: '#e11d48', border: '#fecdd3', light: '#fff1f2', chartPalette: ['#e11d48', '#f59e0b', '#10b981', '#06b6d4', '#8b5cf6', '#3b82f6', '#64748b'] },
+            cyan: { text: '#0284c7', bg: '#0284c7', border: '#bae6fd', light: '#f0f9ff', chartPalette: ['#0284c7', '#10b981', '#6366f1', '#f59e0b', '#ec4899', '#8b5cf6', '#64748b'] },
+            emerald: { text: '#059669', bg: '#059669', border: '#a7f3d0', light: '#ecfdf5', chartPalette: ['#059669', '#0284c7', '#f59e0b', '#8b5cf6', '#ec4899', '#6366f1', '#64748b'] },
+            amber: { text: '#d97706', bg: '#d97706', border: '#fde68a', light: '#fffbeb', chartPalette: ['#d97706', '#059669', '#0284c7', '#e11d48', '#8b5cf6', '#6366f1', '#64748b'] }
+        };
+
+        function changeAccentTheme(themeKey) {
+            appData.accentTheme = themeKey;
+            applyAccentTheme(themeKey);
+            renderDashboardStats();
+            updateCharts();
+            triggerAutoSave();
+        }
+
+        function applyAccentTheme(themeKey) {
+            const pal = THEME_PALETTES[themeKey] || THEME_PALETTES.indigo;
+            const styleEl = document.getElementById('accent-theme-styles');
+            if (styleEl) {
+                styleEl.innerHTML = `
+                    .accent-text-color { color: ${pal.text} !important; }
+                    .accent-bg-badge { background-color: ${pal.bg} !important; }
+                    .accent-btn-bg { background-color: ${pal.bg} !important; }
+                    .accent-icon-color { color: ${pal.text} !important; }
+                    .accent-border-color { border-color: ${pal.border} !important; }
+                    .accent-light-bg { background-color: ${pal.light} !important; }
+                `;
+            }
+            const sel = document.getElementById('accent-theme-select');
+            if (sel) sel.value = themeKey;
+        }
+
+        let isAppDataLoadedFromDisk = false;
+        let isInitializingFromDisk = false;
+        let activeSubjectFilter = 'ALL';
+        let currentActiveNoteId = null;
+        let activeTasksViewMode = 'table';
+        let timerSeconds = 25 * 60;
+        let timerDurationConfigured = 25 * 60;
+        let isTimerRunning = false;
+        let timerInterval = null;
+        let updatePollInterval = null;
+
+        function escapeJsString(str) { return String(str || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;'); }
+        function escapeHtml(str) { return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;'); }
+
+        function openModal(modalId) {
+            const el = document.getElementById(modalId);
+            if (el) { el.classList.remove('hidden'); el.classList.add('flex'); }
+        }
+        function closeModal(modalId) {
+            const el = document.getElementById(modalId);
+            if (el) { el.classList.add('hidden'); el.classList.remove('flex'); }
+        }
+
+        /* ---------------- AUTO UPDATER JS ---------------- */
+        async function openUpdateModal() {
+            openModal('update-modal');
+            await checkUpdateManual();
+        }
+
+        async function checkUpdateManual() {
+            const body = document.getElementById('update-modal-body');
+            const btnInst = document.getElementById('btn-install-update-now');
+            if (!body) return;
+            body.innerHTML = '<p class="text-gray-600 text-xs flex items-center gap-2"><i class="fa-solid fa-spinner fa-spin text-indigo-600"></i> Consultando atualizacoes na nuvem...</p>';
+            if (btnInst) btnInst.classList.add('hidden');
+
+            try {
+                if (window.pywebview && window.pywebview.api) {
+                    const res = await window.pywebview.api.update_check_now();
+                    renderUpdateModalState(res);
+                }
+            } catch (e) {
+                body.innerHTML = `<p class="text-rose-600 text-xs font-semibold">Erro ao checar atualizacoes: ${escapeHtml(e)}</p>`;
+            }
+        }
+
+        function renderUpdateModalState(res) {
+            const body = document.getElementById('update-modal-body');
+            const btnInst = document.getElementById('btn-install-update-now');
+            const indicator = document.getElementById('update-topbar-indicator');
+            const topbarText = document.getElementById('update-topbar-text');
+            if (!body) return;
+
+            if (res.status === 'update_available') {
+                if (indicator && topbarText) {
+                    topbarText.innerText = `Nova versao ${res.latest} disponivel!`;
+                    indicator.classList.remove('hidden');
+                    indicator.classList.add('flex');
+                }
+                body.innerHTML = `
+                    <div class="space-y-3">
+                        <div class="p-3 bg-indigo-50 border border-indigo-200 rounded-lg">
+                            <div class="font-bold text-indigo-900 text-sm flex items-center gap-2">
+                                <i class="fa-solid fa-sparkles text-indigo-600"></i>
+                                <span>Nova Versao ${escapeHtml(res.latest)} Disponivel!</span>
+                            </div>
+                            <p class="text-[11px] text-indigo-700 mt-1">Sua versao atual e <b>${escapeHtml(res.current)}</b>.</p>
+                        </div>
+                        ${res.notes ? `
+                            <div>
+                                <label class="font-bold text-gray-700 text-xs block mb-1">Notas da Versao:</label>
+                                <div class="p-2.5 bg-gray-50 border border-gray-200 rounded text-[11px] text-gray-700 font-mono whitespace-pre-wrap">${escapeHtml(res.notes)}</div>
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
+                if (btnInst) btnInst.classList.remove('hidden');
+            } else if (res.status === 'up_to_date') {
+                if (indicator) indicator.classList.add('hidden');
+                body.innerHTML = `
+                    <div class="p-3 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center gap-2.5">
+                        <i class="fa-solid fa-circle-check text-emerald-600 text-lg"></i>
+                        <div>
+                            <p class="font-bold text-emerald-900 text-xs">Seu Cogni esta atualizado!</p>
+                            <p class="text-[11px] text-emerald-700">Voce esta utilizando a versao mais recente (${escapeHtml(res.current)}).</p>
+                        </div>
+                    </div>
+                `;
+            } else {
+                body.innerHTML = `
+                    <div class="p-3 bg-amber-50 border border-amber-200 rounded-lg">
+                        <p class="font-bold text-amber-900 text-xs">Nao foi possivel consultar atualizacoes.</p>
+                        <p class="text-[11px] text-amber-700 mt-0.5">${escapeHtml(res.message || 'Verifique sua conexao de rede.')}</p>
+                    </div>
+                `;
+            }
+        }
+
+        async function installUpdateNow() {
+            const btnInst = document.getElementById('btn-install-update-now');
+            const progressBox = document.getElementById('update-progress-box');
+            if (btnInst) btnInst.classList.add('hidden');
+            if (progressBox) progressBox.classList.remove('hidden');
+
+            try {
+                if (window.pywebview && window.pywebview.api) {
+                    await window.pywebview.api.update_install();
+                    if (updatePollInterval) clearInterval(updatePollInterval);
+                    updatePollInterval = setInterval(pollUpdateProgress, 500);
+                }
+            } catch (e) {
+                alert("Erro ao iniciar instalacao: " + e);
+            }
+        }
+
+        async function pollUpdateProgress() {
+            try {
+                if (window.pywebview && window.pywebview.api) {
+                    const prog = await window.pywebview.api.update_progress();
+                    const label = document.getElementById('update-progress-label');
+                    const pct = document.getElementById('update-progress-pct');
+                    const bar = document.getElementById('update-progress-bar');
+                    const submsg = document.getElementById('update-progress-submsg');
+
+                    if (prog) {
+                        if (pct) pct.innerText = `${prog.pct || 0}%`;
+                        if (bar) bar.style.width = `${prog.pct || 0}%`;
+                        if (label) label.innerText = prog.mensagem || 'Baixando...';
+                        if (submsg) submsg.innerText = prog.fase || '';
+
+                        if (prog.fase === 'error') {
+                            clearInterval(updatePollInterval);
+                            alert("Erro na atualizacao: " + (prog.mensagem || "Falha desconhecida."));
+                        }
+                    }
+                }
+            } catch (e) { console.warn("Erro ao ler progresso:", e); }
+        }
+
+        /* Initialization logic */
+        window.addEventListener('pywebviewready', () => { loadStateFromDiskSafely(); });
+        setTimeout(() => { if (!isAppDataLoadedFromDisk) loadStateFromDiskSafely(); }, 1500);
+
+        async function loadStateFromDiskSafely() {
+            if (isAppDataLoadedFromDisk || isInitializingFromDisk) return;
+            isInitializingFromDisk = true;
+            try {
+                if (window.pywebview && window.pywebview.api) {
+                    const raw = await window.pywebview.api.load_state_from_disk();
+                    if (raw && raw !== '{}') {
+                        appData = JSON.parse(raw);
+                    }
+                }
+            } catch(e) { console.warn("Load state:", e); }
+            isAppDataLoadedFromDisk = true;
+            isInitializingFromDisk = false;
+            initApp();
+        }
+
+        function initApp() {
+            applyAccentTheme(appData.accentTheme || 'indigo');
+            renderDashboardStats();
+            // Checagem em segundo plano de novas versoes
+            setTimeout(async () => {
+                try {
+                    if (window.pywebview && window.pywebview.api) {
+                        const cached = await window.pywebview.api.update_cached();
+                        if (cached && cached.status === 'update_available') {
+                            renderUpdateModalState(cached);
+                        }
+                    }
+                } catch(e){}
+            }, 3000);
+        }
+
+        function triggerAutoSave() {
+            if (!isAppDataLoadedFromDisk) return;
+            const jsonStr = JSON.stringify(appData, null, 2);
+            if (window.pywebview && window.pywebview.api) {
+                window.pywebview.api.save_state_to_disk(jsonStr);
+            }
+        }
+
+        function renderDashboardStats() {
+            const completed = (appData.tasks || []).filter(t => t.status === 'Concluido').length;
+            const total = (appData.tasks || []).length;
+            const rate = total > 0 ? Math.round((completed / total) * 100) : 0;
+            const elComp = document.getElementById('kpi-completed-tasks');
+            const elRate = document.getElementById('kpi-completion-rate');
+            if (elComp) elComp.innerText = `${completed}/${total}`;
+            if (elRate) elRate.innerText = `${rate}%`;
+        }
+
+        function switchTab(tabName) {
+            document.querySelectorAll('.view-content').forEach(el => el.classList.add('hidden'));
+            document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('bg-notion-hover'));
+            const activeView = document.getElementById(`view-${tabName}`);
+            const activeBtn = document.getElementById(`nav-${tabName}`);
+            if (activeView) activeView.classList.remove('hidden');
+            if (activeBtn) activeBtn.classList.add('bg-notion-hover');
+        }
+
+        function toggleTimer() {
+            const btnText = document.getElementById('timer-btn-text');
+            const iconPlay = document.getElementById('timer-icon-play');
+            const statusLabel = document.getElementById('timer-status-label');
+            if (isTimerRunning) {
+                clearInterval(timerInterval);
+                isTimerRunning = false;
+                if (btnText) btnText.innerText = "Continuar Sessao";
+                if (iconPlay) iconPlay.className = "fa-solid fa-play";
+                if (statusLabel) statusLabel.innerText = "Sessao Pausada";
+            } else {
+                isTimerRunning = true;
+                if (btnText) btnText.innerText = "Pausar";
+                if (iconPlay) iconPlay.className = "fa-solid fa-pause";
+                if (statusLabel) statusLabel.innerText = "Foco Ativo...";
+                timerInterval = setInterval(() => {
+                    if (timerSeconds > 0) {
+                        timerSeconds--;
+                        updateTimerDisplay();
+                    } else {
+                        clearInterval(timerInterval);
+                        isTimerRunning = false;
+                        if (btnText) btnText.innerText = "Iniciar Sessao";
+                        if (iconPlay) iconPlay.className = "fa-solid fa-play";
+                        if (statusLabel) statusLabel.innerText = "Sessao Concluida!";
+                    }
+                }, 1000);
+            }
+        }
+
+        function resetTimer() {
+            clearInterval(timerInterval);
+            isTimerRunning = false;
+            timerSeconds = timerDurationConfigured;
+            updateTimerDisplay();
+            const btnText = document.getElementById('timer-btn-text');
+            const statusLabel = document.getElementById('timer-status-label');
+            if (btnText) btnText.innerText = "Iniciar Sessao";
+            if (statusLabel) statusLabel.innerText = "Pronto para iniciar";
+        }
+
+        function updateTimerDisplay() {
+            const m = String(Math.floor(timerSeconds / 60)).padStart(2, '0');
+            const s = String(timerSeconds % 60).padStart(2, '0');
+            const disp = document.getElementById('timer-display');
+            if (disp) disp.innerText = `${m}:${s}`;
+        }
+    </script>
+</body>
+</html>
+"""
+
+def main():
+    api = CogniDesktopAPI()
+    window = webview.create_window(
+        title='Cogni',
+        html=HTML_CONTENT,
+        js_api=api,
+        width=1280,
+        height=800,
+        min_size=(900, 600),
+        resizable=True
+    )
+    webview.start(debug=False)
+
+if __name__ == '__main__':
+    main()
