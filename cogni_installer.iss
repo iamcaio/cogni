@@ -54,6 +54,7 @@ WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 
 ; Fecha o Cogni automaticamente durante um update silencioso e o reabre.
+AppMutex=CogniDesktopSingleInstance
 CloseApplications=yes
 RestartApplications=yes
 CloseApplicationsFilter=*.exe
