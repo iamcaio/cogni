@@ -73,19 +73,27 @@ class WindowsNotifier:
     def notify(title, message, sound=True):
         def _run():
             try:
-                clean_title = str(title or "Cogni").replace('"', '`"').replace('$', '`$').replace("'", "`'")
-                clean_msg = str(message or "").replace('"', '`"').replace('$', '`$').replace("'", "`'")
+                # Titulo e mensagem vem de nomes de tarefas (importados ou
+                # sincronizados), ou seja, nao sao confiaveis. Nunca entram no
+                # texto do script: o escape manual com crases era contornavel
+                # (`$(comando) executava), entao seguem por variavel de
+                # ambiente e o PowerShell so as le como DADO.
+                env = dict(os.environ)
+                env["COGNI_TOAST_T"] = str(title or "Cogni")[:200]
+                env["COGNI_TOAST_M"] = str(message or "")[:500]
                 audio_tag = '<audio src="ms-winsoundevent:Notification.Default" />' if sound else '<audio silent="true" />'
                 ps_script = f'''
                 try {{
                     [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
                     [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+                    $t = [System.Security.SecurityElement]::Escape($env:COGNI_TOAST_T)
+                    $m = [System.Security.SecurityElement]::Escape($env:COGNI_TOAST_M)
                     $template = @"
                     <toast>
                         <visual>
                             <binding template="ToastGeneric">
-                                <text>{clean_title}</text>
-                                <text>{clean_msg}</text>
+                                <text>$t</text>
+                                <text>$m</text>
                             </binding>
                         </visual>
                         {audio_tag}
@@ -105,7 +113,8 @@ class WindowsNotifier:
                 '''
                 subprocess.run(
                     ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
-                    capture_output=True, text=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    capture_output=True, text=True, timeout=10, env=env,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 )
             except Exception as e:
                 print(f"[Notifier] Erro ao disparar notificacao: {e}")
@@ -1318,7 +1327,22 @@ class CogniDesktopAPI:
             else:
                 norm_path = os.path.normpath(clean_path)
 
-                ext = os.path.splitext(norm_path)[1].lower()
+                # O Windows ignora espacos e pontos no fim do nome: "a.bat " e
+                # "a.bat." executam "a.bat". Sem esta normalizacao a extensao
+                # lida aqui seria "bat " e a lista de bloqueio nao pegaria.
+                # Fluxos alternativos (arq.txt:x.exe) tambem sao recusados.
+                nome_real = os.path.basename(norm_path).rstrip(" .")
+                if ":" in nome_real:
+                    return {"status": "error",
+                            "message": "Nome de arquivo nao permitido por seguranca."}
+                ext = os.path.splitext(nome_real)[1].lower()
+                try:
+                    ext_destino = os.path.splitext(
+                        os.path.basename(os.path.realpath(norm_path)).rstrip(" ."))[1].lower()
+                except Exception:
+                    ext_destino = ext
+                if ext_destino in self.EXTENSOES_EXECUTAVEIS:
+                    ext = ext_destino
                 if ext in self.EXTENSOES_EXECUTAVEIS:
                     return {"status": "error",
                             "message": f"Por seguranca, o Cogni nao abre arquivos "
@@ -3260,7 +3284,56 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             data.selectedDeckIds = ensureArray(data.selectedDeckIds);
             data.selectedNoteIds = ensureArray(data.selectedNoteIds);
 
+            higienizarCamposTecnicos(data);
             return data;
+        }
+
+        /* Campos "tecnicos" (ids, cores, icones, datas, foto) sao usados
+           DENTRO de atributos HTML (onclick, style, class, src) em dezenas de
+           pontos. Os dados chegam da nuvem e de arquivos importados, entao
+           nao sao confiaveis. Em vez de escapar em cada ponto de uso, cada
+           campo e reduzido ao formato que ele pode legitimamente ter. Um valor
+           legitimo passa intacto; um malicioso perde a parte perigosa. */
+        function higienizarCamposTecnicos(data) {
+            const id = v => (v === null || v === undefined) ? v : String(v).replace(/[^A-Za-z0-9_\-.:]/g, '_').slice(0, 120);
+            const cor = (v, pad) => (typeof v === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(v)) ? v : pad;
+            const icone = (v, pad) => (typeof v === 'string' && /^[a-z0-9 \-]{1,60}$/.test(v)) ? v : pad;
+            const data10 = v => (typeof v === 'string' && /^[0-9T:.\- ]{0,32}$/.test(v)) ? v : '';
+            const hora = v => (typeof v === 'string' && /^[0-9:]{0,8}$/.test(v)) ? v : '';
+            const tam = (v, pad) => (typeof v === 'string' && /^[0-9.]{1,4}(px|rem|em)$/.test(v)) ? v : pad;
+            const objs = a => (a || []).filter(x => x && typeof x === 'object');
+
+            const p = data.userProfile;
+            if (p && typeof p === 'object' && p.avatarPhoto &&
+                !/^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+\/=]+$/.test(p.avatarPhoto)) {
+                p.avatarPhoto = '';
+            }
+            Object.keys(data.subjectMeta || {}).forEach(k => {
+                const m = data.subjectMeta[k];
+                if (m && typeof m === 'object') { m.color = cor(m.color, '#64748b'); m.icon = icone(m.icon, 'fa-solid fa-book'); }
+                else delete data.subjectMeta[k];
+            });
+            objs(data.tasks).forEach(t => {
+                t.id = id(t.id); t.icon = icone(t.icon, 'fa-solid fa-book'); t.dueDate = data10(t.dueDate);
+                objs(t.subtasks).forEach(x => { x.id = id(x.id); });
+            });
+            objs(data.flashcardDecks).forEach(d => { d.id = id(d.id); objs(d.cards).forEach(c => { c.id = id(c.id); }); });
+            objs(data.notes).forEach(n => {
+                n.id = id(n.id); n.parentId = id(n.parentId);
+                n.linkedTaskIds = (n.linkedTaskIds || []).map(id);
+                n.linkedPostitIds = (n.linkedPostitIds || []).map(id);
+            });
+            data.openNoteTabs = (data.openNoteTabs || []).map(id);
+            data.activeNoteTabId = id(data.activeNoteTabId);
+            objs(data.postits).forEach(x => { x.id = id(x.id); });
+            objs(data.studyLogs).forEach(x => { x.id = id(x.id); x.date = data10(x.date); });
+            objs(data.calendarEvents).forEach(x => { x.id = id(x.id); x.color = cor(x.color, '#6366f1'); x.time = hora(x.time); x.date = data10(x.date); });
+            objs(data.mindMaps).forEach(m => {
+                m.id = id(m.id);
+                objs(m.nodes).forEach(n => { n.id = id(n.id); n.color = cor(n.color, '#ffffff'); n.textColor = cor(n.textColor, '#1f2937'); n.fontSize = tam(n.fontSize, '14px'); });
+                objs(m.connections).forEach(c => { c.id = id(c.id); c.from = id(c.from); c.to = id(c.to); });
+                objs(m.drawings).forEach(d => { d.id = id(d.id); d.color = cor(d.color, '#1f2937'); });
+            });
         }
 
         function openModal(modalId) {
