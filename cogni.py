@@ -31,7 +31,8 @@ except Exception as e:
     show_native_error_dialog("Erro de Inicializacao - Cogni", err_msg)
     sys.exit(1)
 
-APP_VERSION = "v4.5.4"
+APP_VERSION = "v4.5.5"
+APP_MUTEX = "CogniDesktopSingleInstance"
 
 # Caminho legado: onde o Cogni gravava antes de existir login. Continua no
 # banco como copia de seguranca; nada e apagado dele.
@@ -72,19 +73,27 @@ class WindowsNotifier:
     def notify(title, message, sound=True):
         def _run():
             try:
-                clean_title = str(title or "Cogni").replace('"', '`"').replace('$', '`$').replace("'", "`'")
-                clean_msg = str(message or "").replace('"', '`"').replace('$', '`$').replace("'", "`'")
+                # Titulo e mensagem vem de nomes de tarefas (importados ou
+                # sincronizados), ou seja, nao sao confiaveis. Nunca entram no
+                # texto do script: o escape manual com crases era contornavel
+                # (`$(comando) executava), entao seguem por variavel de
+                # ambiente e o PowerShell so as le como DADO.
+                env = dict(os.environ)
+                env["COGNI_TOAST_T"] = str(title or "Cogni")[:200]
+                env["COGNI_TOAST_M"] = str(message or "")[:500]
                 audio_tag = '<audio src="ms-winsoundevent:Notification.Default" />' if sound else '<audio silent="true" />'
                 ps_script = f'''
                 try {{
                     [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
                     [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+                    $t = [System.Security.SecurityElement]::Escape($env:COGNI_TOAST_T)
+                    $m = [System.Security.SecurityElement]::Escape($env:COGNI_TOAST_M)
                     $template = @"
                     <toast>
                         <visual>
                             <binding template="ToastGeneric">
-                                <text>{clean_title}</text>
-                                <text>{clean_msg}</text>
+                                <text>$t</text>
+                                <text>$m</text>
                             </binding>
                         </visual>
                         {audio_tag}
@@ -104,7 +113,8 @@ class WindowsNotifier:
                 '''
                 subprocess.run(
                     ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
-                    capture_output=True, text=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    capture_output=True, text=True, timeout=10, env=env,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 )
             except Exception as e:
                 print(f"[Notifier] Erro ao disparar notificacao: {e}")
@@ -649,7 +659,28 @@ def _mensagem_amigavel(codigo):
         "OPERATION_NOT_ALLOWED":
             "Login por e-mail/senha está temporariamente indisponível. Tente novamente mais tarde.",
         "TOKEN_EXPIRED": "Sessão expirada. Entre novamente.",
-    }.get(str(codigo), str(codigo))
+        "INVALID_REFRESH_TOKEN": "Sessão expirada. Entre novamente.",
+        "USER_NOT_FOUND": "Esta conta não existe mais. Entre ou crie uma nova.",
+        "MISSING_PASSWORD": "Informe a senha.",
+        "MISSING_EMAIL": "Informe o e-mail.",
+        "NETWORK_ERROR": "Sem conexão com a internet. Verifique a rede e tente de novo.",
+    }.get(str(codigo)) or _mensagem_por_prefixo(str(codigo))
+
+
+def _mensagem_por_prefixo(codigo):
+    """O Firebase anexa detalhes depois do codigo ("CODIGO : texto"). Casa so
+    pelo codigo, para uma mudanca de texto no servidor nao vazar para a tela."""
+    base = codigo.split(" : ")[0].strip()
+    return {
+        "WEAK_PASSWORD": "A senha precisa ter ao menos 6 caracteres.",
+        "TOO_MANY_ATTEMPTS_TRY_LATER":
+            "Muitas tentativas. Aguarde alguns minutos e tente de novo.",
+        "OPERATION_NOT_ALLOWED":
+            "Login por e-mail/senha está temporariamente indisponível. Tente novamente mais tarde.",
+        "INVALID_EMAIL": "E-mail inválido.",
+        "EMAIL_EXISTS": "Este e-mail já está cadastrado. Use 'Entrar'.",
+        "INVALID_LOGIN_CREDENTIALS": "E-mail ou senha incorretos.",
+    }.get(base, codigo)
 
 
 class CloudSync:
@@ -673,6 +704,8 @@ class CloudSync:
         self.email = None
         self.expira_em = 0
         self.ultimo_erro = ""
+        self.sessao_invalida = False
+        self._sessao_validada = False
         self._carregar_config()
         self._carregar_sessao()
 
@@ -755,7 +788,26 @@ class CloudSync:
             self.expira_em = time.time() + 3300
         self._salvar_sessao()
 
+    _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+    def _validar_credenciais(self, email, senha, cadastro=False):
+        """Recusa entradas obviamente invalidas antes de gastar uma chamada de
+        rede e antes de o Firebase devolver um codigo cru."""
+        if not email or not senha:
+            return "Informe e-mail e senha."
+        if len(email) > 254 or not self._EMAIL_RE.match(email):
+            return "E-mail inválido."
+        if cadastro and len(senha) < 6:
+            return "A senha precisa ter ao menos 6 caracteres."
+        if len(senha) > 256:
+            return "Senha longa demais."
+        return None
+
     def criar_conta(self, email, senha):
+        email = (email or "").strip()
+        erro = self._validar_credenciais(email, senha or "", cadastro=True)
+        if erro:
+            return {"status": "error", "message": erro}
         if not self.configurado:
             return {"status": "error", "message": "Configure a chave da API e a URL do banco primeiro."}
         st, corpo = _http_json(f"{IDENTITY_URL}:signUp?key={self.api_key}",
@@ -765,9 +817,15 @@ class CloudSync:
             self._aplicar_resposta_auth(corpo)
             return {"status": "success", "uid": self.uid, "email": self.email}
         msg = (corpo or {}).get("error", {}).get("message", "Falha ao criar conta.")
+        if st == 0 and not str(msg).startswith("Nao foi possivel validar"):
+            msg = "NETWORK_ERROR"
         return {"status": "error", "message": _mensagem_amigavel(msg)}
 
     def entrar(self, email, senha):
+        email = (email or "").strip()
+        erro = self._validar_credenciais(email, senha or "")
+        if erro:
+            return {"status": "error", "message": erro}
         if not self.configurado:
             return {"status": "error", "message": "Configure a chave da API e a URL do banco primeiro."}
         st, corpo = _http_json(f"{IDENTITY_URL}:signInWithPassword?key={self.api_key}",
@@ -777,6 +835,8 @@ class CloudSync:
             self._aplicar_resposta_auth(corpo)
             return {"status": "success", "uid": self.uid, "email": self.email}
         msg = (corpo or {}).get("error", {}).get("message", "Falha ao entrar.")
+        if st == 0 and not str(msg).startswith("Nao foi possivel validar"):
+            msg = "NETWORK_ERROR"
         return {"status": "error", "message": _mensagem_amigavel(msg)}
 
     def sair(self):
@@ -803,8 +863,25 @@ class CloudSync:
                 self.expira_em = time.time() + 3300
             self._salvar_sessao()
             return self.id_token
-        self.ultimo_erro = _mensagem_amigavel((corpo or {}).get("error", {}).get("message", "TOKEN_EXPIRED"))
+        msg = (corpo or {}).get("error", {}).get("message", "TOKEN_EXPIRED") \
+            if isinstance(corpo, dict) else "TOKEN_EXPIRED"
+        self.ultimo_erro = _mensagem_amigavel(msg)
+        # 400/401 = o servidor RECUSOU o refreshToken (conta apagada, senha
+        # trocada, sessao revogada). Diferente de st == 0 (sem rede), que nao
+        # invalida nada: o app segue offline com o cache local.
+        self.sessao_invalida = st in (400, 401)
         return None
+
+    def validar_sessao(self):
+        """'ok' | 'offline' | 'invalida' | 'sem_sessao'. Usado na abertura do
+        app: uma sessao salva mas morta nao pode deixar o usuario preso numa
+        tela 'conectada' que nunca sincroniza."""
+        if not self.logado:
+            return "sem_sessao"
+        self.sessao_invalida = False
+        if self._token_valido():
+            return "ok"
+        return "invalida" if self.sessao_invalida else "offline"
 
     # ------------------------------ dados ------------------------------ #
     def _caminho_dados(self, token):
@@ -1020,6 +1097,12 @@ class CogniDesktopAPI:
     # Conta (expostos ao JS)
     # ------------------------------------------------------------------ #
     def cloud_status(self):
+        if self._cloud.logado and not self._cloud._sessao_validada:
+            self._cloud._sessao_validada = True
+            if self._cloud.validar_sessao() == "invalida":
+                print("[Cogni] Sessao salva recusada pelo servidor; pedindo login.")
+                self._cloud._limpar_sessao()
+                self._aplicar_caminhos_do_usuario()
         r = self._cloud.resumo()
         r["lastSync"] = self._ultimo_sync
         return r
@@ -1030,12 +1113,14 @@ class CogniDesktopAPI:
     def cloud_sign_up(self, email, password):
         r = self._cloud.criar_conta(email, password)
         if r.get("status") == "success":
+            self._cloud._sessao_validada = True
             self._aplicar_caminhos_do_usuario()
         return r
 
     def cloud_sign_in(self, email, password):
         r = self._cloud.entrar(email, password)
         if r.get("status") == "success":
+            self._cloud._sessao_validada = True
             self._aplicar_caminhos_do_usuario()
         return r
 
@@ -1180,6 +1265,10 @@ class CogniDesktopAPI:
             return {"status": "error", "message": f"JSON invalido: {e}"}
 
         res = self._cloud.enviar(dados)
+        if res.get("status") == "auth_error" and self._cloud.sessao_invalida:
+            # O cache local ja foi gravado acima; so a sessao e descartada.
+            self._cloud._limpar_sessao()
+            return {"status": "auth_error", "message": "Sessão expirada. Entre novamente."}
         if res.get("status") == "success":
             self._ultimo_sync = time.strftime("%H:%M:%S")
             # Sem o caminho completo: ele contem o UID e nao deve circular.
@@ -1238,7 +1327,22 @@ class CogniDesktopAPI:
             else:
                 norm_path = os.path.normpath(clean_path)
 
-                ext = os.path.splitext(norm_path)[1].lower()
+                # O Windows ignora espacos e pontos no fim do nome: "a.bat " e
+                # "a.bat." executam "a.bat". Sem esta normalizacao a extensao
+                # lida aqui seria "bat " e a lista de bloqueio nao pegaria.
+                # Fluxos alternativos (arq.txt:x.exe) tambem sao recusados.
+                nome_real = os.path.basename(norm_path).rstrip(" .")
+                if ":" in nome_real:
+                    return {"status": "error",
+                            "message": "Nome de arquivo nao permitido por seguranca."}
+                ext = os.path.splitext(nome_real)[1].lower()
+                try:
+                    ext_destino = os.path.splitext(
+                        os.path.basename(os.path.realpath(norm_path)).rstrip(" ."))[1].lower()
+                except Exception:
+                    ext_destino = ext
+                if ext_destino in self.EXTENSOES_EXECUTAVEIS:
+                    ext = ext_destino
                 if ext in self.EXTENSOES_EXECUTAVEIS:
                     return {"status": "error",
                             "message": f"Por seguranca, o Cogni nao abre arquivos "
@@ -3180,7 +3284,56 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             data.selectedDeckIds = ensureArray(data.selectedDeckIds);
             data.selectedNoteIds = ensureArray(data.selectedNoteIds);
 
+            higienizarCamposTecnicos(data);
             return data;
+        }
+
+        /* Campos "tecnicos" (ids, cores, icones, datas, foto) sao usados
+           DENTRO de atributos HTML (onclick, style, class, src) em dezenas de
+           pontos. Os dados chegam da nuvem e de arquivos importados, entao
+           nao sao confiaveis. Em vez de escapar em cada ponto de uso, cada
+           campo e reduzido ao formato que ele pode legitimamente ter. Um valor
+           legitimo passa intacto; um malicioso perde a parte perigosa. */
+        function higienizarCamposTecnicos(data) {
+            const id = v => (v === null || v === undefined) ? v : String(v).replace(/[^A-Za-z0-9_\-.:]/g, '_').slice(0, 120);
+            const cor = (v, pad) => (typeof v === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(v)) ? v : pad;
+            const icone = (v, pad) => (typeof v === 'string' && /^[a-z0-9 \-]{1,60}$/.test(v)) ? v : pad;
+            const data10 = v => (typeof v === 'string' && /^[0-9T:.\- ]{0,32}$/.test(v)) ? v : '';
+            const hora = v => (typeof v === 'string' && /^[0-9:]{0,8}$/.test(v)) ? v : '';
+            const tam = (v, pad) => (typeof v === 'string' && /^[0-9.]{1,4}(px|rem|em)$/.test(v)) ? v : pad;
+            const objs = a => (a || []).filter(x => x && typeof x === 'object');
+
+            const p = data.userProfile;
+            if (p && typeof p === 'object' && p.avatarPhoto &&
+                !/^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+\/=]+$/.test(p.avatarPhoto)) {
+                p.avatarPhoto = '';
+            }
+            Object.keys(data.subjectMeta || {}).forEach(k => {
+                const m = data.subjectMeta[k];
+                if (m && typeof m === 'object') { m.color = cor(m.color, '#64748b'); m.icon = icone(m.icon, 'fa-solid fa-book'); }
+                else delete data.subjectMeta[k];
+            });
+            objs(data.tasks).forEach(t => {
+                t.id = id(t.id); t.icon = icone(t.icon, 'fa-solid fa-book'); t.dueDate = data10(t.dueDate);
+                objs(t.subtasks).forEach(x => { x.id = id(x.id); });
+            });
+            objs(data.flashcardDecks).forEach(d => { d.id = id(d.id); objs(d.cards).forEach(c => { c.id = id(c.id); }); });
+            objs(data.notes).forEach(n => {
+                n.id = id(n.id); n.parentId = id(n.parentId);
+                n.linkedTaskIds = (n.linkedTaskIds || []).map(id);
+                n.linkedPostitIds = (n.linkedPostitIds || []).map(id);
+            });
+            data.openNoteTabs = (data.openNoteTabs || []).map(id);
+            data.activeNoteTabId = id(data.activeNoteTabId);
+            objs(data.postits).forEach(x => { x.id = id(x.id); });
+            objs(data.studyLogs).forEach(x => { x.id = id(x.id); x.date = data10(x.date); });
+            objs(data.calendarEvents).forEach(x => { x.id = id(x.id); x.color = cor(x.color, '#6366f1'); x.time = hora(x.time); x.date = data10(x.date); });
+            objs(data.mindMaps).forEach(m => {
+                m.id = id(m.id);
+                objs(m.nodes).forEach(n => { n.id = id(n.id); n.color = cor(n.color, '#ffffff'); n.textColor = cor(n.textColor, '#1f2937'); n.fontSize = tam(n.fontSize, '14px'); });
+                objs(m.connections).forEach(c => { c.id = id(c.id); c.from = id(c.from); c.to = id(c.to); });
+                objs(m.drawings).forEach(d => { d.id = id(d.id); d.color = cor(d.color, '#1f2937'); });
+            });
         }
 
         function openModal(modalId) {
@@ -3232,6 +3385,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             const email = (document.getElementById('gateEmail').value || '').trim();
             const senha = document.getElementById('gatePassword').value || '';
             if (!email || !senha) { gateErro('Informe e-mail e senha.'); return; }
+            if (!(window.pywebview && window.pywebview.api && typeof window.pywebview.api[metodo] === 'function')) {
+                gateErro('O aplicativo ainda está iniciando. Aguarde alguns segundos e tente de novo.'); return;
+            }
             gateErro(''); gateOcupado(true);
             try {
                 const r = await window.pywebview.api[metodo](email, senha);
@@ -3275,7 +3431,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 if (evento === 'salvo')      hora.innerText = `Enviado às ${t}`;
                 else if (evento === 'baixado') hora.innerText = `Atualizado às ${t}`;
                 else if (evento === 'offline') { hora.innerText = 'Offline (salvo local)'; hora.className = 'text-amber-600 font-sans'; }
-                else if (!hora.innerText || hora.innerText.includes('Conectando')) hora.innerText = 'Sincronizado';
+                else if (!hora.innerText || hora.innerText.includes('Conectando') || hora.innerText === 'Desconectado' || hora.innerText.startsWith('Offline')) hora.innerText = 'Sincronizado';
             }
         }
 
@@ -3292,6 +3448,16 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             closeModal('profile-modal');
             pintarStatusNuvem();
             mostrarGate();
+        }
+
+        /* A sessao morreu no servidor: volta para a tela de entrada. */
+        async function sessaoExpirada() {
+            isAppDataLoadedFromDisk = false;
+            limparEstadoCogni();
+            try { contaCogni = await window.pywebview.api.cloud_status(); } catch (e) { contaCogni = { configured: true, signedIn: false }; }
+            pintarStatusNuvem();
+            mostrarGate();
+            gateErro('Sua sessão expirou. Entre novamente.');
         }
 
         /* Zera o que ficou da conta anterior em memoria e na tela. */
@@ -3378,13 +3544,18 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             }
         }, 50);
 
+        // So cai para o modo "sem ponte" se NAO houver pywebview (HTML aberto
+        // num navegador). Com pywebview, um arranque lento (antivirus, disco)
+        // nao pode liberar o autosave com dados vazios: isso pulava a tela de
+        // login e gravava um estado em branco por cima da conta.
         setTimeout(() => {
+            if (window.pywebview) return;
             clearInterval(pywebviewInitInterval);
             if (!isAppDataLoadedFromDisk && !isInitializingFromDisk) {
                 isAppDataLoadedFromDisk = true;
                 initApp();
             }
-        }, 3000);
+        }, 30000);
 
         /* ------------------------------------------------------------------
            Sincronizacao periodica com a nuvem.
@@ -3615,6 +3786,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             if (window.pywebview && window.pywebview.api) {
                 ultimaGravacaoLocal = Date.now();
                 window.pywebview.api.save_state_to_disk(jsonStr).then(res => {
+                    if (res && res.status === 'auth_error') { sessaoExpirada(); return; }
                     pintarStatusNuvem((res && res.status === 'success') ? 'salvo' : 'offline');
                 });
             }
@@ -6653,7 +6825,28 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 </html>
 """
 
+_MUTEX_HANDLE = None
+
+
+def _instancia_unica():
+    """False se ja existe um Cogni aberto. Duas janelas dividiriam a mesma
+    sessao e o mesmo cache e se sobrescreveriam. O mesmo nome vai em AppMutex
+    no instalador, que assim detecta o app aberto."""
+    global _MUTEX_HANDLE
+    try:
+        import ctypes
+        _MUTEX_HANDLE = ctypes.windll.kernel32.CreateMutexW(None, False, APP_MUTEX)
+        return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return True
+
+
 def main():
+    if not _instancia_unica():
+        show_native_error_dialog(
+            "Cogni",
+            "O Cogni já está aberto. Procure a janela dele na barra de tarefas.")
+        return
     _registrar_identidade_windows()
     api = CogniDesktopAPI()
     index_uri = _escrever_ui_local('index.html', HTML_CONTENT.replace('__APP_VERSION__', APP_VERSION))

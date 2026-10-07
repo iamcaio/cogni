@@ -21,7 +21,7 @@
 ; ===========================================================================
 
 #define MyAppName        "Cogni"
-#define MyAppVersion     "4.5.4"
+#define MyAppVersion     "4.5.5"
 #define MyAppPublisher   "COGNI"
 #define MyAppExeName     "COGNI.exe"
 
@@ -54,6 +54,7 @@ WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 
 ; Fecha o Cogni automaticamente durante um update silencioso e o reabre.
+AppMutex=CogniDesktopSingleInstance
 CloseApplications=yes
 RestartApplications=yes
 CloseApplicationsFilter=*.exe
