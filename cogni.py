@@ -3358,7 +3358,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 if (evento === 'salvo')      hora.innerText = `Enviado às ${t}`;
                 else if (evento === 'baixado') hora.innerText = `Atualizado às ${t}`;
                 else if (evento === 'offline') { hora.innerText = 'Offline (salvo local)'; hora.className = 'text-amber-600 font-sans'; }
-                else if (!hora.innerText || hora.innerText.includes('Conectando')) hora.innerText = 'Sincronizado';
+                else if (!hora.innerText || hora.innerText.includes('Conectando') || hora.innerText === 'Desconectado' || hora.innerText.startsWith('Offline')) hora.innerText = 'Sincronizado';
             }
         }
 
@@ -3482,7 +3482,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 isAppDataLoadedFromDisk = true;
                 initApp();
             }
-        }, 3000);
+        }, 30000);
 
         /* ------------------------------------------------------------------
            Sincronizacao periodica com a nuvem.
