@@ -21,7 +21,7 @@
 ; ===========================================================================
 
 #define MyAppName        "Cogni"
-#define MyAppVersion     "4.5.4"
+#define MyAppVersion     "4.5.7"
 #define MyAppPublisher   "COGNI"
 #define MyAppExeName     "COGNI.exe"
 

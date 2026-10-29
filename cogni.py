@@ -31,7 +31,7 @@ except Exception as e:
     show_native_error_dialog("Erro de Inicializacao - Cogni", err_msg)
     sys.exit(1)
 
-APP_VERSION = "v4.5.4"
+APP_VERSION = "v4.5.7"
 
 # Caminho legado: onde o Cogni gravava antes de existir login. Continua no
 # banco como copia de seguranca; nada e apagado dele.
@@ -861,6 +861,97 @@ class CloudSync:
 
 
 
+# ---------------------------------------------------------------------------
+# PAINEL SPOTIFY - opcao 3: player PROPRIO (Web API + Web Playback SDK)
+# O Cogni desenha a interface (tema, sem janela nativa por cima). O audio toca
+# num <iframe> invisivel que carrega o Web Playback SDK de um servidor local
+# (127.0.0.1:SPOTIFY_PORT). Login por OAuth PKCE no navegador padrao; o token
+# fica no Python (a interface chama a Web API por spotify_api).
+# Exige Spotify Premium (regra do SDK) e um app no Spotify for Developers.
+# Mesma arquitetura do NEXUS; porta propria (8899) para os dois abrirem juntos.
+# ---------------------------------------------------------------------------
+SPOTIFY_PORT = 8899
+SPOTIFY_REDIRECT = "http://127.0.0.1:%d/callback" % SPOTIFY_PORT
+SPOTIFY_SCOPES = ("streaming user-read-email user-read-private user-read-playback-state "
+                  "user-modify-playback-state user-read-currently-playing "
+                  "playlist-read-private playlist-read-collaborative user-library-read")
+
+_SPOTIFY_PLAYER_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>Player do Spotify</title></head><body>
+<script>
+(function () {
+  var N = new URLSearchParams(location.search).get('n') || '';
+  var player = null;
+  function post(o) { try { o.nxsp = 1; parent.postMessage(o, '*'); } catch (e) { } }
+  function slim(s) {
+    if (!s) return null;
+    var t = s.track_window && s.track_window.current_track;
+    if (!t) return { paused: true, track: null };
+    var imgs = (t.album && t.album.images) || [];
+    return { paused: s.paused, position: s.position, duration: s.duration, ts: s.timestamp,
+      shuffle: s.shuffle, repeat: s.repeat_mode,
+      track: { uri: t.uri, name: t.name, artists: (t.artists || []).map(function (a) { return a.name; }),
+               image: (imgs[imgs.length > 1 ? 1 : 0] || {}).url || '' },
+      context: (s.context && s.context.uri) || '' };
+  }
+  window.onSpotifyWebPlaybackSDKReady = function () {
+    player = new Spotify.Player({
+      name: 'Cogni', volume: 0.6,
+      getOAuthToken: function (cb) {
+        fetch('/token?n=' + encodeURIComponent(N), { cache: 'no-store' })
+          .then(function (r) { return r.json(); })
+          .then(function (j) { if (j && j.token) cb(j.token); else post({ type: 'error', kind: 'authentication_error', msg: 'Sem token' }); })
+          .catch(function () { post({ type: 'error', kind: 'authentication_error', msg: 'Falha ao obter token' }); });
+      }
+    });
+    player.addListener('ready', function (e) { post({ type: 'ready', device_id: e.device_id }); });
+    player.addListener('not_ready', function () { post({ type: 'not_ready' }); });
+    player.addListener('player_state_changed', function (s) { post({ type: 'state', state: slim(s) }); });
+    ['initialization_error', 'authentication_error', 'account_error', 'playback_error'].forEach(function (k) {
+      player.addListener(k, function (e) { post({ type: 'error', kind: k, msg: (e && e.message) || k }); });
+    });
+    player.connect().then(function (ok) { if (!ok) post({ type: 'error', kind: 'connect', msg: 'Nao foi possivel iniciar o player' }); });
+  };
+  window.addEventListener('message', function (e) {
+    if (e.source !== parent || !player) return;
+    var m = e.data; if (!m || !m.nxsp) return;
+    switch (m.cmd) {
+      case 'toggle': player.togglePlay(); break;
+      case 'next': player.nextTrack(); break;
+      case 'prev': player.previousTrack(); break;
+      case 'seek': player.seek(Math.max(0, Number(m.ms) || 0)); break;
+      case 'volume': player.setVolume(Math.min(1, Math.max(0, Number(m.v)))); break;
+      case 'activate': try { player.activateElement(); } catch (x) { } break;
+      case 'state': player.getCurrentState().then(function (s) { post({ type: 'state', state: slim(s) }); }); break;
+    }
+  });
+  var sc = document.createElement('script');
+  sc.src = 'https://sdk.scdn.co/spotify-player.js';
+  sc.onerror = function () { post({ type: 'error', kind: 'sdk', msg: 'Nao foi possivel carregar o SDK do Spotify (rede bloqueada?)' }); };
+  document.head.appendChild(sc);
+})();
+</script></body></html>"""
+
+
+def _dpapi(dados, cifrar):
+    """Protege/abre bytes com a chave do usuario do Windows (DPAPI)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.c_void_p)]
+
+    buf = ctypes.create_string_buffer(dados, len(dados))
+    entrada = _BLOB(len(dados), ctypes.cast(buf, ctypes.c_void_p))
+    saida = _BLOB()
+    fn = ctypes.windll.crypt32.CryptProtectData if cifrar else ctypes.windll.crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(entrada), None, None, None, None, 0, ctypes.byref(saida)):
+        raise OSError("DPAPI falhou")
+    try:
+        return ctypes.string_at(saida.pbData, saida.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(ctypes.c_void_p(saida.pbData))
+
+
 class CogniDesktopAPI:
     """
     Ponte de Comunicacao entre Python e a Interface Web (JS/HTML).
@@ -874,6 +965,317 @@ class CogniDesktopAPI:
             return {"status": "success"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
+    # ------------------------------------------------------------------ #
+    # Painel Spotify (opcao 3)
+    # ------------------------------------------------------------------ #
+    def _sp_st(self):
+        if not hasattr(self, "_spx"):
+            import base64
+            self._spx = {"cfg": None, "access": "", "exp": 0.0, "server": None, "auth": None,
+                         "nonce": base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("="),
+                         "erro": None, "lock": threading.Lock()}
+        return self._spx
+
+    def _sp_cfg(self):
+        st = self._sp_st()
+        if st["cfg"] is None:
+            cfg = {}
+            try:
+                with open(os.path.join(self._base_dir, "spotify.json"), "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except Exception:
+                cfg = {}
+            st["cfg"] = cfg if isinstance(cfg, dict) else {}
+        return st["cfg"]
+
+    def _sp_cfg_save(self):
+        caminho = os.path.join(self._base_dir, "spotify.json")
+        tmp = caminho + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._sp_cfg(), f)
+        os.replace(tmp, caminho)
+
+    def _sp_refresh_get(self):
+        import base64
+        cfg = self._sp_cfg()
+        r = cfg.get("refresh")
+        if not r:
+            return ""
+        try:
+            raw = base64.b64decode(r)
+            if cfg.get("enc"):
+                raw = _dpapi(raw, False)
+            return raw.decode("utf-8")
+        except Exception:
+            return ""
+
+    def _sp_refresh_set(self, token):
+        import base64
+        raw, enc = token.encode("utf-8"), False
+        try:
+            raw, enc = _dpapi(raw, True), True       # criptografado com a conta do Windows
+        except Exception:
+            pass
+        cfg = self._sp_cfg()
+        cfg["refresh"] = base64.b64encode(raw).decode("ascii")
+        cfg["enc"] = enc
+        self._sp_cfg_save()
+
+    def _sp_http(self, method, url, body=None, headers=None, timeout=20):
+        data = None
+        if body is not None:
+            data = body if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx_strict) as r:
+                return r.status, r.read(), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read(), dict(e.headers or {})
+
+    def _sp_token_form(self, campos):
+        import urllib.parse
+        status, corpo, _ = self._sp_http(
+            "POST", "https://accounts.spotify.com/api/token", urllib.parse.urlencode(campos),
+            {"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            j = json.loads(corpo.decode("utf-8", "replace"))
+        except Exception:
+            j = {}
+        return status, (j if isinstance(j, dict) else {})
+
+    def _sp_access(self):
+        """Access token valido (renova com o refresh token quando preciso)."""
+        st = self._sp_st()
+        with st["lock"]:
+            if st["access"] and time.time() < st["exp"] - 60:
+                return st["access"]
+            ref, cid = self._sp_refresh_get(), self._sp_cfg().get("client_id", "")
+            if not ref or not cid:
+                return ""
+            try:
+                status, j = self._sp_token_form({"grant_type": "refresh_token", "refresh_token": ref, "client_id": cid})
+            except Exception as e:
+                st["erro"] = "Sem conexao com o Spotify: " + str(e)
+                return ""
+            if status == 200 and j.get("access_token"):
+                st["access"], st["exp"] = j["access_token"], time.time() + int(j.get("expires_in", 3600))
+                if j.get("refresh_token"):
+                    self._sp_refresh_set(j["refresh_token"])
+                st["erro"] = None
+                return st["access"]
+            if status in (400, 401):                 # refresh token revogado/expirado
+                self._sp_limpar_sessao()
+            st["erro"] = "O Spotify recusou a renovacao do login (%s)." % status
+            return ""
+
+    def _sp_limpar_sessao(self):
+        st = self._sp_st()
+        st["access"], st["exp"] = "", 0.0
+        cfg = self._sp_cfg()
+        cfg.pop("refresh", None)
+        cfg.pop("enc", None)
+        try:
+            self._sp_cfg_save()
+        except Exception:
+            pass
+
+    def _sp_servidor(self):
+        """Sobe (uma vez) o servidor local: /callback (OAuth), /player e /token."""
+        st = self._sp_st()
+        if st["server"]:
+            return True
+        import http.server
+        import html as _html
+        import urllib.parse
+        import base64
+        api = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, ctype, corpo):
+                b = corpo.encode("utf-8") if isinstance(corpo, str) else corpo
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(b)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(b)
+
+            def _callback(self, q):
+                code = (q.get("code") or [""])[0]
+                state = (q.get("state") or [""])[0]
+                err = (q.get("error") or [""])[0]
+                auth, msg, ok = st["auth"], "", False
+                if err:
+                    msg = "Autorizacao negada (%s)." % err
+                elif not auth or not code or state != auth["state"] or time.time() - auth["t"] > 600:
+                    msg = "Pedido invalido ou expirado. Volte ao Cogni e clique em Conectar de novo."
+                else:
+                    try:
+                        status, j = api._sp_token_form({
+                            "grant_type": "authorization_code", "code": code, "redirect_uri": SPOTIFY_REDIRECT,
+                            "client_id": api._sp_cfg().get("client_id", ""), "code_verifier": auth["verifier"]})
+                        if status == 200 and j.get("refresh_token"):
+                            st["access"], st["exp"] = j.get("access_token", ""), time.time() + int(j.get("expires_in", 3600))
+                            api._sp_refresh_set(j["refresh_token"])
+                            st["auth"], st["erro"], ok = None, None, True
+                        else:
+                            msg = "O Spotify recusou o codigo (%s) %s" % (status, j.get("error_description", ""))
+                    except Exception as e:
+                        msg = "Falha ao concluir o login: " + str(e)
+                titulo = "Cogni conectado ao Spotify" if ok else "Nao foi possivel conectar"
+                corpo = ("<!doctype html><meta charset=utf-8><title>Conexao Spotify</title>"
+                         "<body style='background:#0a0a0a;color:#e5e5e5;font-family:Segoe UI,sans-serif;"
+                         "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>"
+                         "<div style='text-align:center'><h2>%s</h2><p>%s</p></div></body>" % (
+                             _html.escape(titulo),
+                             "Pode fechar esta aba e voltar ao Cogni." if ok else _html.escape(msg)))
+                self._send(200 if ok else 400, "text/html; charset=utf-8", corpo)
+
+            def do_GET(self):
+                try:
+                    if (self.headers.get("Host") or "") != "127.0.0.1:%d" % SPOTIFY_PORT:
+                        return self._send(403, "text/plain", "host")      # defesa contra DNS rebinding
+                    u = urllib.parse.urlparse(self.path)
+                    q = urllib.parse.parse_qs(u.query)
+                    if u.path == "/callback":
+                        return self._callback(q)
+                    if (q.get("n") or [""])[0] != st["nonce"]:
+                        return self._send(403, "text/plain", "nonce")
+                    if u.path == "/player":
+                        return self._send(200, "text/html; charset=utf-8", _SPOTIFY_PLAYER_HTML)
+                    if u.path == "/token":
+                        if self.headers.get("Sec-Fetch-Site") not in (None, "same-origin"):
+                            return self._send(403, "text/plain", "origem")
+                        tok = api._sp_access()
+                        return self._send(200 if tok else 401, "application/json", json.dumps({"token": tok}))
+                    self._send(404, "text/plain", "nao encontrado")
+                except Exception:
+                    try:
+                        self._send(500, "text/plain", "erro")
+                    except Exception:
+                        pass
+
+        class S(http.server.ThreadingHTTPServer):
+            daemon_threads = True
+            allow_reuse_address = False      # no Windows, reuse permitiria outro processo roubar a porta
+
+        try:
+            srv = S(("127.0.0.1", SPOTIFY_PORT), H)
+        except OSError as e:
+            st["erro"] = "A porta %d esta ocupada (%s). Feche o outro programa ou outra copia do Cogni." % (SPOTIFY_PORT, e)
+            return False
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        st["server"] = srv
+        return True
+
+    def spotify_info(self):
+        st = self._sp_st()
+        cfg = self._sp_cfg()
+        conectado = bool(self._sp_refresh_get())
+        out = {"clientId": bool(cfg.get("client_id")), "connected": conectado, "redirect": SPOTIFY_REDIRECT,
+               "erro": st["erro"], "playerUrl": None}
+        if conectado and self._sp_servidor():
+            out["playerUrl"] = "http://127.0.0.1:%d/player?n=%s" % (SPOTIFY_PORT, st["nonce"])
+            out["erro"] = st["erro"]
+        return out
+
+    def spotify_salvar_client(self, client_id):
+        import re
+        cid = str(client_id or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", cid):
+            return {"status": "error", "message": "O Client ID tem 32 caracteres (letras a-f e numeros)."}
+        cfg = self._sp_cfg()
+        if cfg.get("client_id") != cid:
+            self._sp_limpar_sessao()
+        cfg["client_id"] = cid
+        try:
+            self._sp_cfg_save()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+        return {"status": "success"}
+
+    def spotify_conectar(self):
+        """Inicia o login (OAuth PKCE) no navegador padrao."""
+        try:
+            import base64
+            import hashlib
+            import urllib.parse
+            cid = self._sp_cfg().get("client_id", "")
+            if not cid:
+                return {"status": "error", "message": "Informe o Client ID primeiro."}
+            if not self._sp_servidor():
+                return {"status": "error", "message": self._sp_st()["erro"] or "Servidor local indisponivel."}
+            verifier = base64.urlsafe_b64encode(os.urandom(64)).decode().rstrip("=")
+            challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+            state = base64.urlsafe_b64encode(os.urandom(16)).decode().rstrip("=")
+            self._sp_st()["auth"] = {"verifier": verifier, "state": state, "t": time.time()}
+            url = "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode({
+                "client_id": cid, "response_type": "code", "redirect_uri": SPOTIFY_REDIRECT,
+                "scope": SPOTIFY_SCOPES, "code_challenge_method": "S256",
+                "code_challenge": challenge, "state": state})
+            import webbrowser
+            webbrowser.open(url)
+            return {"status": "success", "url": url}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def spotify_abrir(self, url):
+        """Abre no navegador padrao SO as duas paginas do Spotify que o painel usa."""
+        u = str(url or "")
+        if u.startswith("https://developer.spotify.com/dashboard") or u.startswith("https://accounts.spotify.com/authorize?"):
+            webbrowser.open(u)
+            return {"status": "success"}
+        return {"status": "error", "message": "URL nao permitida."}
+
+    def spotify_desconectar(self):
+        self._sp_limpar_sessao()
+        return {"status": "success"}
+
+    def spotify_api(self, method, path, body=None):
+        """Proxy da Web API do Spotify: o token nunca chega a interface."""
+        import re
+        try:
+            method = str(method or "").upper()
+            path = str(path or "")
+            if method not in ("GET", "PUT", "POST"):
+                return {"status": 0, "message": "Metodo nao permitido."}
+            if not re.fullmatch(r"/v1/[A-Za-z0-9_\-/.:%=&?,+~]*", path) or ".." in path:
+                return {"status": 0, "message": "Caminho nao permitido."}
+            tok = self._sp_access()
+            if not tok:
+                return {"status": 401, "data": None, "message": "Nao conectado."}
+            headers = {"Authorization": "Bearer " + tok}
+            dados = None
+            if body is not None:
+                dados = json.dumps(body)
+                headers["Content-Type"] = "application/json"
+            status, raw, hdr = self._sp_http(method, "https://api.spotify.com" + path, dados, headers)
+            parsed = None
+            if raw:
+                try:
+                    parsed = json.loads(raw.decode("utf-8", "replace"))
+                except Exception:
+                    parsed = None
+            out = {"status": status, "data": parsed}
+            if status == 429:
+                out["retry"] = hdr.get("Retry-After")
+            return out
+        except Exception as e:
+            return {"status": 0, "message": str(e)}
+
+    def _spotify_encerrar(self):
+        st = self._sp_st()
+        srv, st["server"] = st["server"], None
+        if srv:
+            threading.Thread(target=srv.shutdown, daemon=True).start()
 
     def __init__(self):
         # Pasta raiz do app. Cada CONTA recebe a sua subpasta (users/<uid>),
@@ -1516,12 +1918,12 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://cdn.jsdelivr.net;
         style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://fonts.googleapis.com;
         font-src 'self' data: https://cdnjs.cloudflare.com https://fonts.gstatic.com;
-        img-src 'self' data: blob:;
+        img-src 'self' data: blob: https://*.scdn.co https://*.spotifycdn.com;
         connect-src 'self' https://cogni-data-default-rtdb.firebaseio.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com;
         object-src 'none';
         base-uri 'none';
         form-action 'none';
-        frame-src 'none';
+        frame-src http://127.0.0.1:8899;
     ">
 
     <!-- VERSOES FIXAS. 'npm/chart.js' sem versao entrega o que o CDN quiser
@@ -1666,6 +2068,122 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         .cg-task-panel [class*="bg-notion-lightBg"], .cg-task-panel [class*="bg-blue-50"], .cg-task-panel [class*="bg-rose-50"] { background:#f7f8fa !important; border:0 !important; border-radius:10px !important; padding:7px 10px !important; }
         .cg-task-panel [class*="text-blue-"], .cg-task-panel [class*="text-rose-"] { color:#4b5563 !important; }
         @media (max-width: 1100px) { .cg-task-panel { width:340px; } }
+
+        /* ---- Caderno de Notas: coluna lateral direita (acompanha a rolagem) ---- */
+        .nt-wrap { display:flex; gap:20px; align-items:flex-start; max-width:1100px; margin:0 auto; width:100%; }
+        .nt-main { flex:1; min-width:0; }
+        .nt-dock { position:sticky; top:0; align-self:flex-start; display:flex; gap:10px; flex-shrink:0; z-index:25; }
+        .nt-panel { width:300px; display:none; max-height:calc(100vh - 150px); overflow-y:auto; }
+        .nt-panel.open { display:block; }
+        .nt-panel .nt-card { display:none; }
+        .nt-panel .nt-card.on { display:flex; }
+        .nt-rail { width:42px; display:flex; flex-direction:column; align-items:center; gap:6px; padding-top:2px; }
+        .nt-rb { position:relative; width:36px; height:36px; border-radius:50%; display:flex; align-items:center; justify-content:center; background:transparent; color:#6b7280; font-size:14px; transition:background .15s,color .15s; cursor:pointer; }
+        .nt-rb:hover { background:#e9ebef; color:#111827; }
+        .nt-rb.on { background:#e3e6ec; color:#111827; box-shadow:inset 0 0 0 1px #d5d9e0; }
+        .nt-rb::after { content:attr(data-tip); position:absolute; right:calc(100% + 8px); top:50%; transform:translateY(-50%); background:#1f2937; color:#fff; font-size:11px; font-weight:600; padding:4px 9px; border-radius:6px; white-space:nowrap; opacity:0; pointer-events:none; transition:opacity .12s; }
+        .nt-rb:hover::after { opacity:1; }
+        .nt-rbc { position:absolute; top:-2px; right:-2px; min-width:15px; height:15px; border-radius:999px; background:#4f46e5; color:#fff; font-size:9px; line-height:15px; text-align:center; padding:0 4px; display:none; }
+        .nt-rbc.show { display:block; }
+        @media (max-width: 1250px) { .nt-panel { position:absolute; right:52px; top:0; z-index:30; box-shadow:0 12px 32px rgba(15,23,42,.18); border-radius:12px; } }
+        .nt-tabwrap { display:flex; align-items:stretch; background:var(--cg-sbbg,#fff); border-bottom:1px solid #eef0f3; flex-shrink:0; }
+        .nt-tabwrap > #notes-tab-bar { border-bottom:0 !important; }
+        .nt-tabtoggle { width:34px; flex-shrink:0; color:#9ca3af; font-size:13px; }
+        .nt-tabtoggle:hover { color:#111827; }
+        .nl-off { display:none !important; }
+        #cg-sidebar { transition:width .2s cubic-bezier(.2,.8,.2,1); overflow:hidden; }
+        #cg-sidebar.sb-collapsed { width:56px; }
+        #cg-sidebar.sb-collapsed span, #cg-sidebar.sb-collapsed .sb-label, #cg-sidebar.sb-collapsed .sb-subjects { display:none !important; }
+        #cg-sidebar.sb-collapsed .sb-top { justify-content:center; }
+        #cg-sidebar.sb-collapsed .nav-btn { justify-content:center; padding-left:0; padding-right:0; }
+        #cg-sidebar.sb-collapsed .p-3 { padding:8px 6px; }
+        #cg-sidebar.sb-collapsed #sb-toggle i { transform:rotate(180deg); }
+        .nt-card { background:#fff; border:1px solid #eef0f3; border-radius:12px; padding:12px 14px; display:flex; flex-direction:column; gap:8px; }
+        .nt-h { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; font-weight:700; color:#374151; }
+        .nt-h i { margin-right:5px; }
+        .nt-acts { display:flex; gap:10px; font-size:11px; font-weight:600; }
+        .nt-badge { background:#f1f2f4; color:#6b7280; border-radius:999px; font-size:10px; padding:1px 7px; margin-left:4px; }
+        .nt-select { width:100%; font-size:11px; border:1px solid #e5e7eb; border-radius:8px; padding:5px 8px; background:#fff; color:#374151; }
+        .nt-list { display:flex; flex-direction:column; gap:6px; font-size:12px; }
+        .nt-empty { color:#9ca3af; font-size:11px; }
+        .nt-row { display:flex; align-items:center; gap:6px; background:#f7f8fa; border-radius:8px; padding:6px 8px; }
+        .nt-row > button:not(.nt-chk):not(.nt-x) { flex:1; min-width:0; text-align:left; display:flex; align-items:center; gap:6px; }
+        .nt-row .nt-t { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .nt-row .nt-x { color:#d1d5db; flex-shrink:0; }
+        .nt-row .nt-x:hover { color:#ef4444; }
+        .nt-chk { width:16px; height:16px; border-radius:50%; border:1.5px solid #cbd5e1; background:#fff; flex-shrink:0; display:flex; align-items:center; justify-content:center; color:transparent; font-size:8px; padding:0; cursor:pointer; transition:all .15s; }
+        .nt-chk:hover { border-color:#16a34a; color:#16a34a; }
+        .nt-chk.on { background:#16a34a; border-color:#16a34a; color:#fff; }
+        .nt-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; background:#9ca3af; }
+        .nt-dot.done { background:#16a34a; } .nt-dot.doing { background:#2563eb; }
+
+        /* ---- Painel Spotify (player proprio) + barra de aplicativos: segue o tema de cor do usuario ---- */
+        .sp-panel { position: relative; width: 380px; flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; background: #fff; border-left: 1px solid #eef0f3; z-index: 6; }
+        .sp-panel.hidden { display: none !important; }
+        .sp-resize { position: absolute; left: -4px; top: 0; bottom: 0; width: 8px; cursor: col-resize; z-index: 30; }
+        .sp-resize:hover, .sp-resize.drag { background: var(--accent-light, #eef2ff); }
+        .sp-head { height: 46px; display: flex; align-items: center; gap: 6px; padding: 0 14px; border-bottom: 1px solid #f0f1f3; font-size: 13px; font-weight: 700; color: #111827; flex-shrink: 0; }
+        .sp-title i { margin-right: 6px; color: var(--accent-bg, #4f46e5); }
+        .sp-sub { font-size: 11px; color: #9ca3af; font-weight: 600; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .sp-acts { display: flex; gap: 2px; }
+        .sp-acts button { width: 28px; height: 28px; border-radius: 8px; color: #9ca3af; font-size: 12px; cursor: pointer; }
+        .sp-acts button:hover { background: #f4f5f7; color: #111827; }
+        .sp-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+        .sp-card { padding: 18px; font-size: 12.5px; color: #4b5563; overflow-y: auto; line-height: 1.55; }
+        .sp-card h3 { font-size: 14px; font-weight: 700; color: #111827; margin-bottom: 4px; }
+        .sp-card a { color: var(--accent-bg, #4f46e5); text-decoration: underline; cursor: pointer; }
+        .sp-steps { margin: 10px 0 12px 18px; list-style: decimal; display: flex; flex-direction: column; gap: 6px; color: #6b7280; }
+        .sp-code { display: block; margin-top: 4px; padding: 7px 9px; background: #f7f8fa; border-radius: 8px; font-family: Consolas, monospace; font-size: 11px; color: #111827; user-select: text; word-break: break-all; }
+        .sp-input { width: 100%; background: #f7f8fa; border: 1px solid #eef0f3; border-radius: 10px; padding: 9px 12px; color: #111827; font-size: 12.5px; outline: none; user-select: text; }
+        .sp-input:focus { border-color: var(--accent-bg, #4f46e5); box-shadow: 0 0 0 3px var(--accent-light, #eef2ff); }
+        .sp-btn { margin-top: 10px; width: 100%; background: var(--accent-bg, #4f46e5); color: #fff; font-weight: 700; font-size: 12.5px; padding: 9px; border-radius: 10px; cursor: pointer; transition: filter .15s; }
+        .sp-btn:hover { filter: brightness(1.1); }
+        .sp-btn.ghost { background: #f4f5f7; color: #374151; }
+        .sp-btn.ghost:hover { background: #eceef1; filter: none; }
+        .sp-note { margin-top: 10px; font-size: 11.5px; color: #9ca3af; line-height: 1.5; }
+        .sp-err { margin-top: 10px; padding: 8px 11px; border-radius: 10px; background: #fef2f2; color: #b91c1c; font-size: 11.5px; line-height: 1.4; }
+        .sp-tabs { display: flex; gap: 6px; padding: 12px 14px 0; flex-shrink: 0; }
+        .sp-tabs button { flex: 1; padding: 7px; border-radius: 10px; font-size: 12px; font-weight: 700; color: #6b7280; background: #f4f5f7; cursor: pointer; }
+        .sp-tabs button.on { background: var(--accent-light, #eef2ff); color: var(--accent-bg, #4f46e5); }
+        .sp-aviso { margin: 8px 14px 0; padding: 7px 11px; border-radius: 10px; background: #fef2f2; color: #b91c1c; font-size: 11.5px; line-height: 1.4; flex-shrink: 0; }
+        .sp-aviso.ok { background: var(--accent-light, #eef2ff); color: var(--accent-bg, #4f46e5); }
+        .sp-aviso:empty { display: none; }
+        .sp-lista { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 10px 12px; }
+        .sp-sec { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: #9ca3af; padding: 12px 6px 4px; }
+        .sp-row { display: flex; align-items: center; gap: 10px; padding: 6px; border-radius: 10px; cursor: pointer; }
+        .sp-row:hover { background: #f4f5f7; }
+        .sp-row.tocando .sp-r-n { color: var(--accent-bg, #4f46e5); }
+        .sp-cover { width: 40px; height: 40px; border-radius: 8px; object-fit: cover; background: #eceef1; flex-shrink: 0; }
+        .sp-r-t { flex: 1; min-width: 0; }
+        .sp-r-n { font-size: 12.5px; font-weight: 600; color: #111827; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .sp-r-s { font-size: 11px; color: #9ca3af; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .sp-r-b { width: 28px; height: 28px; border-radius: 50%; color: #6b7280; font-size: 11px; flex-shrink: 0; opacity: 0; cursor: pointer; }
+        .sp-row:hover .sp-r-b { opacity: 1; }
+        .sp-r-b:hover { background: #e5e7eb; color: #111827; }
+        .sp-voltar { display: flex; align-items: center; gap: 6px; padding: 4px 4px 8px; font-size: 12.5px; font-weight: 700; color: #111827; }
+        .sp-voltar button { width: 28px; height: 28px; border-radius: 8px; color: #6b7280; cursor: pointer; flex-shrink: 0; }
+        .sp-voltar button:hover { background: #f4f5f7; color: #111827; }
+        .sp-voltar button.sp-smart { color: var(--accent-bg, #4f46e5); }
+        .sp-voltar span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .sp-now { border-top: 1px solid #eef0f3; padding: 12px 14px; display: flex; flex-direction: column; gap: 9px; background: #fff; flex-shrink: 0; }
+        .sp-now.hidden { display: none !important; }
+        .sp-np { display: flex; align-items: center; gap: 10px; }
+        .sp-ctrl { display: flex; align-items: center; gap: 3px; flex-shrink: 0; }
+        .sp-ctrl button { width: 28px; height: 28px; border-radius: 50%; color: #4b5563; font-size: 12px; cursor: pointer; }
+        .sp-ctrl button:hover { background: #f4f5f7; color: #111827; }
+        .sp-ctrl button.on { color: var(--accent-bg, #4f46e5); background: var(--accent-light, #eef2ff); }
+        .sp-ctrl .sp-pp { width: 34px; height: 34px; background: var(--accent-bg, #4f46e5); color: #fff; font-size: 13px; }
+        .sp-ctrl .sp-pp:hover { background: var(--accent-bg, #4f46e5); color: #fff; filter: brightness(1.1); }
+        .sp-seek, .sp-vol { display: flex; align-items: center; gap: 8px; font-size: 10px; color: #9ca3af; font-variant-numeric: tabular-nums; }
+        .sp-seek input, .sp-vol input { flex: 1; accent-color: var(--accent-bg, #4f46e5); height: 4px; cursor: pointer; }
+        .sp-vol i { width: 14px; text-align: center; }
+        .sp-frame { position: fixed; left: -10px; top: -10px; width: 1px; height: 1px; border: 0; opacity: 0; pointer-events: none; }
+        .cg-apprail { width: 48px; flex-shrink: 0; background: #fff; border-left: 1px solid #eef0f3; display: flex; flex-direction: column; align-items: center; padding-top: 12px; gap: 8px; z-index: 7; }
+        .cg-apprail button { position: relative; width: 36px; height: 36px; border-radius: 50%; color: #9ca3af; font-size: 17px; cursor: pointer; transition: background .15s, color .15s; }
+        .cg-apprail button:hover { background: #f4f5f7; color: #111827; }
+        .cg-apprail button.on { background: var(--accent-light, #eef2ff); color: var(--accent-bg, #4f46e5); }
+        .cg-apprail button::after { content: attr(data-tip); position: absolute; right: calc(100% + 8px); top: 50%; transform: translateY(-50%); background: #1f2937; color: #fff; font-size: 11px; font-weight: 600; padding: 4px 9px; border-radius: 6px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity .12s; }
+        .cg-apprail button:hover::after { opacity: 1; }
 
         /* ---- Tema: fundo cinza claro, cartoes brancos arredondados, icones 2D cinza ---- */
         body { background: #f4f5f7; }
@@ -1812,11 +2330,14 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     <div class="flex-1 flex overflow-hidden relative">
         <!-- SIDEBAR -->
-        <aside class="w-64 bg-notion-sidebar border-r border-notion-border flex flex-col justify-between shrink-0 select-none z-10">
+        <aside id="cg-sidebar" class="w-64 bg-notion-sidebar border-r border-notion-border flex flex-col justify-between shrink-0 select-none z-10">
             <div class="p-3 space-y-4 overflow-y-auto">
                 
                 <div class="space-y-0.5">
-                    <div class="text-[10px] font-semibold text-notion-muted uppercase tracking-wider px-2 mb-1">Menu Principal</div>
+                    <div class="sb-top flex items-center justify-between px-2 mb-1">
+                        <div class="sb-label text-[10px] font-semibold text-notion-muted uppercase tracking-wider">Menu Principal</div>
+                        <button type="button" id="sb-toggle" onclick="toggleSidebar()" title="Recolher menu" class="text-gray-400 hover:text-gray-700 p-0.5"><i class="fa-solid fa-angles-left text-[11px]"></i></button>
+                    </div>
                     
                     <!-- Icones do Menu Principal em cinza neutro (2D), sem cor
                          por item - a cor so aparece como feedback de estado
@@ -1864,7 +2385,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                     </button>
                 </div>
 
-                <div class="space-y-1.5 pt-3 border-t border-notion-border">
+                <div class="sb-subjects space-y-1.5 pt-3 border-t border-notion-border">
                     <div class="flex items-center justify-between px-2 mb-1">
                         <span class="text-[10px] font-semibold text-notion-muted uppercase tracking-wider">Matérias Ativas</span>
                         <div class="flex items-center space-x-1">
@@ -2111,7 +2632,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
             <!-- VIEW NOTES -->
             <section id="view-notes" class="view-content hidden flex-1 flex h-full">
-                <div class="w-64 border-r border-notion-border bg-notion-sidebar flex flex-col shrink-0">
+                <div id="notes-list-col" class="w-64 border-r border-notion-border bg-notion-sidebar flex flex-col shrink-0">
                     <div class="p-3 border-b border-notion-border flex items-center justify-between">
                         <span class="text-xs font-semibold text-gray-700 flex items-center gap-1.5">
                             <i class="fa-solid fa-book-bookmark text-amber-500"></i> Suas Notas
@@ -2132,46 +2653,20 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                     <!-- Abas de cadernos abertos ao mesmo tempo, estilo Notion/Google
                          Docs: abrir um caderno Y nao fecha o caderno X que ja estava
                          aberto. Ver renderNoteTabs()/openNoteInTab() abaixo. -->
-                    <div id="notes-tab-bar" class="flex items-center gap-1 px-3 pt-2 bg-notion-sidebar border-b border-notion-border overflow-x-auto shrink-0"></div>
+                    <div class="nt-tabwrap">
+                        <button type="button" id="nl-toggle" onclick="toggleListaNotas()" title="Ocultar lista de notas" class="nt-tabtoggle"><i class="fa-solid fa-table-columns"></i></button>
+                        <div id="notes-tab-bar" class="flex items-center gap-1 px-3 pt-2 bg-notion-sidebar border-b border-notion-border overflow-x-auto shrink-0" style="flex:1;min-width:0"></div>
+                    </div>
                     <div class="flex-1 overflow-y-auto p-8">
-                    <div class="max-w-3xl mx-auto w-full space-y-5">
-                        <div class="flex items-center justify-between border-b border-notion-border pb-3">
-                            <div class="flex items-center space-x-2 text-xs">
-                                <span class="text-notion-muted font-medium">Matéria:</span>
-                                <select id="note-subject-select" onchange="updateNoteSubject(this.value)" class="bg-gray-100 border border-notion-border px-2 py-0.5 rounded font-semibold focus:outline-none cursor-pointer"></select>
-                            </div>
+                    <div class="nt-wrap">
+                    <div class="nt-main space-y-5">
+                        <div class="flex items-center justify-end border-b border-notion-border pb-3">
                             <button onclick="deleteCurrentNote()" class="text-xs text-red-500 hover:text-red-700 px-2 py-1 rounded hover:bg-red-50">
                                 <i class="fa-solid fa-trash mr-1"></i> Excluir Nota
                             </button>
                         </div>
 
                         <input type="text" id="note-editor-title" oninput="updateCurrentNote()" placeholder="Título da anotação..." class="w-full text-3xl font-bold text-gray-900 border-none outline-none placeholder-gray-300 bg-transparent">
-
-                        <div class="p-3 bg-notion-lightBg border border-notion-border rounded-lg space-y-2">
-                            <div class="flex items-center justify-between text-xs font-semibold text-gray-700">
-                                <span class="flex items-center gap-1.5"><i class="fa-solid fa-paperclip accent-icon-color"></i> Anexos & Links</span>
-                                <div class="flex space-x-2 text-[11px]">
-                                    <button type="button" onclick="addLinkToNote()" class="accent-text-color hover:underline">+ Adicionar Link</button>
-                                    <button type="button" onclick="attachFileToNote()" class="text-rose-600 hover:underline">+ Anexar Arquivo</button>
-                                </div>
-                            </div>
-                            <div id="note-resources-list" class="flex flex-wrap gap-2 text-xs pt-1"></div>
-                        </div>
-
-                        <div class="p-3 bg-notion-lightBg border border-notion-border rounded-lg space-y-2">
-                            <div class="flex items-center justify-between text-xs font-semibold text-gray-700">
-                                <span class="flex items-center gap-1.5"><i class="fa-solid fa-link accent-icon-color"></i> Tarefas & Post-its Vinculados</span>
-                                <div class="flex items-center gap-2 text-[11px]">
-                                    <select id="note-link-task-select" onchange="vincularTarefaANota(this.value); this.value='';" class="border rounded px-1.5 py-0.5 bg-white text-gray-700 max-w-[140px]">
-                                        <option value="">+ Vincular Tarefa</option>
-                                    </select>
-                                    <select id="note-link-postit-select" onchange="vincularPostitANota(this.value); this.value='';" class="border rounded px-1.5 py-0.5 bg-white text-gray-700 max-w-[140px]">
-                                        <option value="">+ Vincular Post-it</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <div id="note-linked-items-list" class="flex flex-wrap gap-2 text-xs pt-1"></div>
-                        </div>
 
                         <div class="sticky top-0 z-20 flex flex-wrap items-center gap-1.5 p-2 bg-notion-lightBg border border-notion-border rounded-lg text-xs shadow-sm">
                             <button type="button" onclick="execDocCmd('bold')" title="Negrito" class="w-7 h-7 bg-white border rounded font-bold flex items-center justify-center">B</button>
@@ -2193,7 +2688,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                             <button type="button" onclick="execDocCmd('hiliteColor', '#bbf7d0')" class="w-4 h-4 rounded-full bg-emerald-300 border" title="Marca-Texto Verde"></button>
                             <button type="button" onclick="execDocCmd('hiliteColor', '#bfdbfe')" class="w-4 h-4 rounded-full bg-blue-300 border" title="Marca-Texto Azul"></button>
 
-                            <button type="button" onclick="clearFormattingCmd()" class="ml-auto text-[11px] text-rose-600 font-bold px-2 py-1 bg-white border rounded">Limpar</button>
+                            <button type="button" onmousedown="event.preventDefault()" onclick="criarTarefaDaSelecao()" title="Criar tarefa a partir do texto selecionado" class="ml-auto text-[11px] text-emerald-700 font-bold px-2 py-1 bg-white border rounded"><i class="fa-solid fa-list-check mr-1"></i>Tarefa</button>
+                            <button type="button" onclick="clearFormattingCmd()" class="text-[11px] text-rose-600 font-bold px-2 py-1 bg-white border rounded">Limpar</button>
                         </div>
 
                         <div id="note-editor-content" 
@@ -2201,6 +2697,54 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                              oninput="updateCurrentNote()" 
                              data-placeholder="Digite suas anotações aqui..." 
                              class="w-full min-h-[350px] border border-notion-border rounded-lg p-5 outline-none text-sm leading-relaxed bg-white font-sans overflow-y-auto"></div>
+                    </div>
+
+                    <div class="nt-dock">
+<div id="nt-panel" class="nt-panel">
+                        <div class="nt-card" data-p="materia">
+                            <div class="nt-h"><span><i class="fa-solid fa-folder-open accent-icon-color"></i> Matéria</span></div>
+                            <select id="note-subject-select" onchange="updateNoteSubject(this.value)" class="nt-select"></select>
+                        </div>
+
+                        <div class="nt-card" data-p="anexos">
+                            <div class="nt-h">
+                                <span><i class="fa-solid fa-paperclip accent-icon-color"></i> Anexos &amp; Links</span>
+                                <span class="nt-acts">
+                                    <button type="button" onclick="addLinkToNote()" class="accent-text-color hover:underline">+ Link</button>
+                                    <button type="button" onclick="attachFileToNote()" class="text-rose-600 hover:underline">+ Arquivo</button>
+                                </span>
+                            </div>
+                            <div id="note-resources-list" class="nt-list"></div>
+                        </div>
+
+                        <div class="nt-card" data-p="tarefas">
+                            <div class="nt-h">
+                                <span><i class="fa-solid fa-list-check accent-icon-color"></i> Tarefas <b id="note-tasks-count" class="nt-badge">0</b></span>
+                                <span class="nt-acts">
+                                    <button type="button" onmousedown="event.preventDefault()" onclick="criarTarefaDaSelecao()" class="text-emerald-700 hover:underline" title="Cria uma tarefa com o texto selecionado na nota">+ Da seleção</button>
+                                </span>
+                            </div>
+                            <select id="note-link-task-select" onchange="vincularTarefaANota(this.value); this.value='';" class="nt-select">
+                                <option value="">+ Vincular tarefa existente</option>
+                            </select>
+                            <div id="note-linked-tasks-list" class="nt-list"></div>
+                        </div>
+
+                        <div class="nt-card" data-p="postits">
+                            <div class="nt-h"><span><i class="fa-solid fa-note-sticky accent-icon-color"></i> Post-its <b id="note-postits-count" class="nt-badge">0</b></span></div>
+                            <select id="note-link-postit-select" onchange="vincularPostitANota(this.value); this.value='';" class="nt-select">
+                                <option value="">+ Vincular post-it</option>
+                            </select>
+                            <div id="note-linked-postits-list" class="nt-list"></div>
+                        </div>
+                    </div>
+<div class="nt-rail">
+    <button type="button" class="nt-rb" data-b="materia" data-tip="Matéria" onclick="ntAbrirPainel('materia')"><i class="fa-solid fa-folder-open"></i></button>
+    <button type="button" class="nt-rb" data-b="anexos" data-tip="Anexos &amp; Links" onclick="ntAbrirPainel('anexos')"><i class="fa-solid fa-paperclip"></i><b id="rb-anexos" class="nt-rbc"></b></button>
+    <button type="button" class="nt-rb" data-b="tarefas" data-tip="Tarefas" onclick="ntAbrirPainel('tarefas')"><i class="fa-solid fa-list-check"></i><b id="rb-tarefas" class="nt-rbc"></b></button>
+    <button type="button" class="nt-rb" data-b="postits" data-tip="Post-its" onclick="ntAbrirPainel('postits')"><i class="fa-solid fa-note-sticky"></i><b id="rb-postits" class="nt-rbc"></b></button>
+</div>
+</div>
                     </div>
                     </div>
                 </div>
@@ -2441,7 +2985,51 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 </div>
             </form>
         </aside>
+
+        <!-- PAINEL SPOTIFY (player proprio) - encaixado na lateral direita, segue o tema de cor escolhido -->
+        <aside id="sp-panel" class="sp-panel hidden">
+            <div id="sp-resize" class="sp-resize" title="Arraste para redimensionar" onpointerdown="spResizeIniciar(event)"></div>
+            <div class="sp-head">
+                <span class="sp-title"><i class="fa-brands fa-spotify"></i> Spotify</span>
+                <span id="sp-sub" class="sp-sub"></span>
+                <span class="sp-acts" style="margin-left:auto">
+                    <button type="button" id="sp-btn-sair" class="hidden" onclick="spDesconectar()" title="Desconectar a conta"><i class="fa-solid fa-right-from-bracket"></i></button>
+                    <button type="button" onclick="spotifyToggle()" title="Fechar painel (a música continua tocando)"><i class="fa-solid fa-xmark"></i></button>
+                </span>
+            </div>
+            <div id="sp-body" class="sp-body"><div class="sp-card">Carregando...</div></div>
+            <div id="sp-now" class="sp-now hidden">
+                <div class="sp-np">
+                    <img id="sp-np-img" class="sp-cover" alt="" referrerpolicy="no-referrer">
+                    <div class="sp-r-t">
+                        <div id="sp-np-title" class="sp-r-n">Nada tocando</div>
+                        <div id="sp-np-art" class="sp-r-s"></div>
+                    </div>
+                    <div class="sp-ctrl">
+                        <button type="button" id="sp-shuf" onclick="spShuffle()" title="Modo aleatório"><i class="fa-solid fa-shuffle"></i></button>
+                        <button type="button" onclick="spCmd('prev')" title="Anterior"><i class="fa-solid fa-backward-step"></i></button>
+                        <button type="button" id="sp-pp" class="sp-pp" onclick="spCmd('toggle')" title="Tocar/Pausar"><i class="fa-solid fa-play"></i></button>
+                        <button type="button" onclick="spCmd('next')" title="Próxima"><i class="fa-solid fa-forward-step"></i></button>
+                    </div>
+                </div>
+                <div class="sp-seek">
+                    <span id="sp-t0">0:00</span>
+                    <input type="range" id="sp-seek" min="0" max="1000" value="0" oninput="spSeekInput(this.value)" onchange="spSeekFim(this.value)">
+                    <span id="sp-t1">0:00</span>
+                </div>
+                <div class="sp-vol"><i class="fa-solid fa-volume-low"></i>
+                    <input type="range" id="sp-vol" min="0" max="100" value="60" oninput="spCmd('volume', this.value / 100)">
+                </div>
+            </div>
+        </aside>
+
+        <!-- BARRA DE APLICATIVOS (lado direito) -->
+        <div id="cg-apprail" class="cg-apprail">
+            <button type="button" id="sp-rail-btn" onclick="spotifyToggle()" data-tip="Spotify"><i class="fa-brands fa-spotify"></i></button>
+        </div>
     </div>
+
+    <iframe id="sp-frame" class="sp-frame" allow="autoplay; encrypted-media" tabindex="-1" aria-hidden="true" title="Player do Spotify"></iframe>
 
     <!-- MODAL EVENTO DE CALENDARIO -->
     <div id="calendar-event-modal" class="fixed inset-0 bg-black/40 backdrop-blur-sm hidden flex items-center justify-center z-50 p-4">
@@ -2862,6 +3450,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 `;
             }
             document.documentElement.style.setProperty('--accent-bg', pal.bg);
+            document.documentElement.style.setProperty('--accent-light', pal.light);
+            document.documentElement.style.setProperty('--accent-border', pal.border);
             const sel = document.getElementById('accent-theme-select');
             if (sel) sel.value = themeKey;
         }
@@ -4324,12 +4914,17 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             const status = document.getElementById('modal-task-status').value;
             const dueDate = document.getElementById('modal-task-date').value;
 
-            let progress = 0;
+            // Sem etapas, o progresso vem do slider da lista de Tarefas: manter
+            // o valor ja salvo (antes era zerado a cada salvamento do painel).
+            const prevTask = appData.tasks.find(t => t.id === id);
+            let progress = prevTask ? (Number(prevTask.progress) || 0) : 0;
             if (modalSubtasksTemp.length > 0) {
                 const doneCount = modalSubtasksTemp.filter(s => s.completed).length;
                 progress = Math.round((doneCount / modalSubtasksTemp.length) * 100);
             } else if (status === 'Concluído') {
                 progress = 100;
+            } else if (progress === 100) {
+                progress = 0;
             }
 
             const taskObj = {
@@ -4347,6 +4942,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             };
 
             const existingIndex = appData.tasks.findIndex(t => t.id === id);
+            if (existingIndex >= 0 && appData.tasks[existingIndex].noteId) taskObj.noteId = appData.tasks[existingIndex].noteId;
             if (existingIndex >= 0) {
                 appData.tasks[existingIndex] = taskObj;
             } else {
@@ -4814,17 +5410,19 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             const container = document.getElementById('note-resources-list');
             if (!container) return;
             if (!note.resources || note.resources.length === 0) {
-                container.innerHTML = `<span class="text-notion-muted text-[11px]">Nenhum link ou arquivo anexado.</span>`;
+                container.innerHTML = `<span class="nt-empty">Nenhum link ou arquivo anexado.</span>`;
+                ntAtualizarContadores(note);
                 return;
             }
             container.innerHTML = note.resources.map((r, idx) => `
-                <div class="bg-white border px-2.5 py-1 rounded font-medium flex items-center gap-1.5 shadow-2xs text-xs">
-                    <button type="button" onclick="triggerOpenFile('${escapeJsString(r.url)}')" class="hover:underline flex items-center gap-1 cursor-pointer ${r.type === 'file' ? 'text-rose-600' : 'accent-text-color'}">
-                        <i class="fa-solid ${r.type === 'file' ? 'fa-file-pdf' : 'fa-link'} text-[10px]"></i> ${escapeHtml(r.name || r.url)}
+                <div class="nt-row">
+                    <button type="button" onclick="triggerOpenFile('${escapeJsString(r.url)}')" class="hover:underline cursor-pointer ${r.type === 'file' ? 'text-rose-600' : 'accent-text-color'}" title="${escapeHtml(r.name || r.url)}">
+                        <i class="fa-solid ${r.type === 'file' ? 'fa-file-pdf' : 'fa-link'} text-[10px]"></i><span class="nt-t">${escapeHtml(r.name || r.url)}</span>
                     </button>
-                    <button type="button" onclick="removeNoteResource(${idx})" class="text-red-400 hover:text-red-600 ml-1"><i class="fa-solid fa-xmark"></i></button>
+                    <button type="button" onclick="removeNoteResource(${idx})" class="nt-x"><i class="fa-solid fa-xmark"></i></button>
                 </div>
             `).join('');
+            ntAtualizarContadores(note);
         }
 
         /* ------------------------------------------------------------------
@@ -4848,39 +5446,556 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         }
 
         function renderNoteLinkedItems(note) {
-            const container = document.getElementById('note-linked-items-list');
-            if (!container) return;
+            const cTasks = document.getElementById('note-linked-tasks-list');
+            const cPost = document.getElementById('note-linked-postits-list');
+            if (!cTasks || !cPost) return;
 
-            const chipsTarefas = (note.linkedTaskIds || []).map((id, idx) => {
-                const t = appData.tasks.find(x => x.id === id);
-                if (!t) return '';
+            const tarefas = (note.linkedTaskIds || []).map(id => appData.tasks.find(x => x.id === id)).filter(Boolean);
+            cTasks.innerHTML = tarefas.map(t => {
                 return `
-                    <div class="bg-white border px-2.5 py-1 rounded font-medium flex items-center gap-1.5 shadow-2xs text-xs">
-                        <button type="button" onclick="editTask('${t.id}')" class="hover:underline flex items-center gap-1 cursor-pointer text-emerald-700">
-                            <i class="fa-solid fa-list-check text-[10px]"></i> ${escapeHtml(t.title)}
+                    <div class="nt-row">
+                        <button type="button" onclick="alternarTarefaConcluida('${t.id}')" class="nt-chk ${t.status === 'Concluído' ? 'on' : ''}" title="${t.status === 'Concluído' ? 'Reabrir tarefa' : 'Marcar como concluída'}"><i class="fa-solid fa-check"></i></button>
+                        <button type="button" onclick="editTask('${t.id}')" class="hover:underline cursor-pointer text-gray-800" title="${escapeHtml(t.title)} — ${escapeHtml(t.status || '')}">
+                            <span class="nt-t ${t.status === 'Concluído' ? 'line-through text-gray-400' : ''}">${escapeHtml(t.title)}</span>
                         </button>
-                        <button type="button" onclick="desvincularTarefaDaNota('${t.id}')" class="text-red-400 hover:text-red-600 ml-1"><i class="fa-solid fa-xmark"></i></button>
-                    </div>
-                `;
-            });
+                        <button type="button" onclick="desvincularTarefaDaNota('${t.id}')" class="nt-x" title="Desvincular"><i class="fa-solid fa-xmark"></i></button>
+                    </div>`;
+            }).join('') || `<span class="nt-empty">Nenhuma tarefa nesta nota.</span>`;
+            const cnt = document.getElementById('note-tasks-count');
+            if (cnt) cnt.textContent = tarefas.length;
 
-            const chipsPostits = (note.linkedPostitIds || []).map(id => {
-                const p = appData.postits.find(x => x.id === id);
-                if (!p) return '';
-                return `
-                    <div class="bg-white border px-2.5 py-1 rounded font-medium flex items-center gap-1.5 shadow-2xs text-xs">
-                        <button type="button" onclick="switchTab('postits')" class="hover:underline flex items-center gap-1 cursor-pointer text-rose-600">
-                            <i class="fa-solid fa-note-sticky text-[10px]"></i> ${escapeHtml((p.text || 'Post-it sem texto').slice(0, 30))}
+            const postits = (note.linkedPostitIds || []).map(id => appData.postits.find(x => x.id === id)).filter(Boolean);
+            ntAtualizarContadores(note);
+            cPost.innerHTML = postits.map(p => `
+                    <div class="nt-row">
+                        <button type="button" onclick="switchTab('postits')" class="hover:underline cursor-pointer text-rose-600">
+                            <i class="fa-solid fa-note-sticky text-[10px]"></i><span class="nt-t">${escapeHtml((p.text || 'Post-it sem texto').slice(0, 40))}</span>
                         </button>
-                        <button type="button" onclick="desvincularPostitDaNota('${p.id}')" class="text-red-400 hover:text-red-600 ml-1"><i class="fa-solid fa-xmark"></i></button>
-                    </div>
-                `;
-            });
-
-            const todosOsChips = chipsTarefas.concat(chipsPostits).join('');
-            container.innerHTML = todosOsChips || `<span class="text-notion-muted text-[11px]">Nenhuma tarefa ou post-it vinculado.</span>`;
+                        <button type="button" onclick="desvincularPostitDaNota('${p.id}')" class="nt-x" title="Desvincular"><i class="fa-solid fa-xmark"></i></button>
+                    </div>`).join('') || `<span class="nt-empty">Nenhum post-it vinculado.</span>`;
+            const cnt2 = document.getElementById('note-postits-count');
+            if (cnt2) cnt2.textContent = postits.length;
 
             renderNoteLinkOptions(note);
+        }
+
+        /* ---------------- Painel Spotify (player proprio: Web API + Web Playback SDK) ---------------- */
+        const SP_ORIGEM = 'http://127.0.0.1:8899';
+        let spAberto = false, spW = 380, spInfo = null, spMe = null, spDevice = '', spState = null;
+        let spIniciado = false, spTab = 'playlists', spSeeking = false, spBuscaT = 0, spTimer = null, spPollConn = null;
+        let spPlOffset = 0, spPlAtual = null, spShufflePref = null;
+        try { spW = Number(localStorage.getItem('nx-sp-w')) || 380; } catch (e) { }
+
+        function spAplicarLargura(w) {
+            spW = Math.max(320, Math.min(700, Math.min(w, window.innerWidth - 640)));
+            const p = document.getElementById('sp-panel');
+            if (p) p.style.width = spW + 'px';
+        }
+        spAplicarLargura(spW);
+        function spResizeIniciar(e) {
+            e.preventDefault();
+            const h = e.currentTarget, x0 = e.clientX, w0 = spW;
+            h.setPointerCapture(e.pointerId);
+            h.classList.add('drag');
+            const mover = ev => spAplicarLargura(w0 + (x0 - ev.clientX));
+            const soltar = () => {
+                h.classList.remove('drag');
+                h.removeEventListener('pointermove', mover);
+                h.removeEventListener('pointerup', soltar);
+                h.removeEventListener('pointercancel', soltar);
+                try { localStorage.setItem('nx-sp-w', String(spW)); } catch (err) { }
+            };
+            h.addEventListener('pointermove', mover);
+            h.addEventListener('pointerup', soltar);
+            h.addEventListener('pointercancel', soltar);
+        }
+
+        function spApi() { return window.pywebview && window.pywebview.api; }
+        async function spChamar(metodo, caminho, corpo) {
+            const a = spApi();
+            if (!a || !a.spotify_api) return { status: 0, message: 'Disponível só no aplicativo desktop.' };
+            try { return await a.spotify_api(metodo, caminho, corpo === undefined ? null : corpo); }
+            catch (e) { return { status: 0, message: String(e) }; }
+        }
+        const spOk = r => r && r.status >= 200 && r.status < 300;
+        const spUriOk = u => /^spotify:(track|album|playlist|episode|artist):[A-Za-z0-9]{10,30}$/.test(String(u || ''));
+        const spIdOk = i => /^[A-Za-z0-9]{10,30}$/.test(String(i || ''));
+        const spImg = u => /^https:\/\/[a-z0-9.-]+\.(scdn\.co|spotifycdn\.com)\//i.test(String(u || '')) ? u : '';
+        function spFmt(ms) { const s = Math.max(0, Math.floor((ms || 0) / 1000)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
+        const spBody = () => document.getElementById('sp-body');
+
+        function spotifyToggle() {
+            spAberto = !spAberto;
+            document.getElementById('sp-panel').classList.toggle('hidden', !spAberto);
+            const b = document.getElementById('sp-rail-btn');
+            if (b) b.classList.toggle('on', spAberto);
+            if (spAberto && !spIniciado) { spIniciado = true; spCarregar(); }
+        }
+
+        function spCabecalho() {
+            const sub = document.getElementById('sp-sub');
+            const sair = document.getElementById('sp-btn-sair');
+            const conectado = !!(spInfo && spInfo.connected);
+            if (sub) sub.textContent = conectado && spMe ? (spMe.display_name || spMe.id || '') : '';
+            if (sair) sair.classList.toggle('hidden', !(spInfo && (spInfo.connected || spInfo.clientId)));
+            document.getElementById('sp-now').classList.toggle('hidden', !conectado);
+        }
+
+        async function spCarregar() {
+            const a = spApi();
+            if (!a || !a.spotify_info) { spBody().innerHTML = '<div class="sp-card">O Spotify só está disponível no aplicativo desktop.</div>'; return; }
+            try { spInfo = await a.spotify_info(); } catch (e) { spBody().innerHTML = '<div class="sp-card sp-err">Falha ao iniciar: ' + escapeHtml(String(e)) + '</div>'; return; }
+            spCabecalho();
+            if (!spInfo.clientId) return spRenderSetup();
+            if (!spInfo.connected) return spRenderConectar();
+            spRenderPrincipal();
+            spIniciarPlayer();
+            if (!spMe) {
+                const r = await spChamar('GET', '/v1/me');
+                if (spOk(r)) { spMe = r.data; spCabecalho(); spListarPlaylists(); }
+                else if (r.status === 403) spAviso('O Spotify bloqueou o app (403). No modo de desenvolvimento, o dono do app precisa ter Premium e a sua conta deve estar liberada em User Management no dashboard.');
+            }
+        }
+
+        function spRenderSetup(erro) {
+            spBody().innerHTML = `
+                <div class="sp-card">
+                    <h3>Conectar o Spotify (só uma vez)</h3>
+                    <ol class="sp-steps">
+                        <li>Abra o <a onclick="spotifyUrl('https://developer.spotify.com/dashboard')">Spotify for Developers</a> e crie um app.</li>
+                        <li>Em <b>Redirect URIs</b>, adicione exatamente:<code class="sp-code">${escapeHtml(spInfo ? spInfo.redirect : '')}</code></li>
+                        <li>Marque <b>Web API</b> e <b>Web Playback SDK</b> e salve.</li>
+                        <li>Em <b>User Management</b>, adicione o e-mail da sua conta Spotify.</li>
+                        <li>Copie o <b>Client ID</b> e cole abaixo.</li>
+                    </ol>
+                    <input id="sp-cid" class="sp-input" placeholder="Client ID (32 caracteres)" spellcheck="false" autocomplete="off">
+                    <button type="button" class="sp-btn" onclick="spSalvarClient()">Salvar e continuar</button>
+                    ${erro ? `<div class="sp-err">${escapeHtml(erro)}</div>` : ''}
+                    <div class="sp-note">Exige conta <b>Premium</b> (regra do Spotify para tocar dentro de outros aplicativos). Seu login fica só neste computador.</div>
+                </div>`;
+        }
+        async function spSalvarClient() {
+            const v = (document.getElementById('sp-cid') || {}).value || '';
+            const r = await spApi().spotify_salvar_client(v);
+            if (r && r.status === 'success') return spCarregar();
+            spRenderSetup(r && r.message);
+        }
+
+        function spRenderConectar(msg, url) {
+            spBody().innerHTML = `
+                <div class="sp-card">
+                    <h3>Entrar no Spotify</h3>
+                    <div class="sp-note" style="margin-top:0">${msg ? escapeHtml(msg) : 'O login abre no seu navegador padrão. Depois de autorizar, volte ao Cogni.'}</div>
+                    ${url ? `<div class="sp-note">Se o navegador não abriu, <a onclick="spotifyUrl('${escapeHtml(escapeJsString(url))}')">clique aqui</a>.</div>` : ''}
+                    <button type="button" class="sp-btn" onclick="spConectar()">Conectar ao Spotify</button>
+                    ${spInfo && spInfo.erro ? `<div class="sp-err">${escapeHtml(spInfo.erro)}</div>` : ''}
+                    <button type="button" class="sp-btn ghost" onclick="spTrocarClient()">Trocar Client ID</button>
+                </div>`;
+        }
+        function spTrocarClient() { spInfo.clientId = false; spRenderSetup(); }
+        async function spConectar() {
+            const r = await spApi().spotify_conectar();
+            if (!r || r.status !== 'success') { spRenderConectar((r && r.message) || 'Falha ao iniciar o login.'); return; }
+            spRenderConectar('Aguardando você autorizar no navegador...', r.url);
+            let n = 0;
+            clearInterval(spPollConn);
+            spPollConn = setInterval(async () => {
+                n++;
+                const i = await spApi().spotify_info();
+                if (i && i.connected) { clearInterval(spPollConn); spPollConn = null; spCarregar(); }
+                else if (n > 160) { clearInterval(spPollConn); spPollConn = null; spRenderConectar('Tempo esgotado. Tente conectar de novo.'); }
+            }, 1500);
+        }
+        async function spDesconectar() {
+            if (!confirm('Desconectar a conta do Spotify neste computador?')) return;
+            clearInterval(spTimer); spTimer = null;
+            const f = document.getElementById('sp-frame');
+            if (f) { f.src = 'about:blank'; f.dataset.on = ''; }
+            await spApi().spotify_desconectar();
+            spMe = null; spDevice = ''; spState = null; spPlAtual = null;
+            spCarregar();
+        }
+        function spotifyUrl(u) {
+            const a = spApi();
+            if (a && a.spotify_abrir) a.spotify_abrir(u);
+        }
+
+        function spRenderPrincipal() {
+            spBody().innerHTML = `
+                <div class="sp-tabs">
+                    <button type="button" id="sp-tab-playlists" onclick="spAba('playlists')">Playlists</button>
+                    <button type="button" id="sp-tab-buscar" onclick="spAba('buscar')">Buscar</button>
+                </div>
+                <div id="sp-aviso" class="sp-aviso"></div>
+                <div id="sp-lista" class="sp-lista"></div>`;
+            spAba(spTab);
+        }
+        function spAviso(msg, ok) { const el = document.getElementById('sp-aviso'); if (!el) return; el.textContent = msg || ''; el.classList.toggle('ok', !!ok); }
+        function spAba(t) {
+            spTab = t;
+            ['playlists', 'buscar'].forEach(k => { const b = document.getElementById('sp-tab-' + k); if (b) b.classList.toggle('on', k === t); });
+            if (t === 'playlists') { spPlAtual = null; spListarPlaylists(); }
+            else spRenderBusca();
+        }
+
+        function spLinha(o) {
+            // o: {act, uri, ctx, id, name, img, titulo, sub, play, atual}
+            const d = ['act', 'uri', 'ctx', 'id', 'name'].map(k => o[k] ? ` data-${k}="${escapeHtml(o[k])}"` : '').join('');
+            const img = spImg(o.img);
+            return `<div class="sp-row ${o.atual ? 'tocando' : ''}"${d} onclick="spClick(this)">
+                ${img ? `<img class="sp-cover" src="${escapeHtml(img)}" alt="" referrerpolicy="no-referrer">` : '<div class="sp-cover"></div>'}
+                <div class="sp-r-t"><div class="sp-r-n">${escapeHtml(o.titulo || '')}</div><div class="sp-r-s">${escapeHtml(o.sub || '')}</div></div>
+                ${o.play ? `<button type="button" class="sp-r-b" title="Tocar" data-act="${escapeHtml(o.play.act)}" data-uri="${escapeHtml(o.play.uri)}" onclick="event.stopPropagation(); spClick(this)"><i class="fa-solid fa-play"></i></button>` : ''}
+            </div>`;
+        }
+        function spClick(el) {
+            const d = el.dataset;
+            if (d.act === 'play-ctx' && spUriOk(d.uri)) spTocar({ context_uri: d.uri });
+            else if (d.act === 'play-track' && spUriOk(d.uri)) spTocar({ uris: [d.uri] });
+            else if (d.act === 'play-in' && spUriOk(d.uri) && spUriOk(d.ctx)) spTocar({ context_uri: d.ctx, offset: { uri: d.uri } });
+            else if (d.act === 'open-pl' && spIdOk(d.id) && spUriOk(d.uri)) spAbrirPlaylist(d.id, d.name || 'Playlist', d.uri, 0);
+        }
+
+        async function spListarPlaylists() {
+            const el = document.getElementById('sp-lista');
+            if (!el || spTab !== 'playlists') return;
+            el.innerHTML = '<div class="sp-note" style="padding:8px">Carregando playlists...</div>';
+            const r = await spChamar('GET', '/v1/me/playlists?limit=50');
+            if (!spOk(r)) { el.innerHTML = `<div class="sp-err" style="margin:8px">${escapeHtml(spMsgErro(r))}</div>`; return; }
+            const itens = ((r.data && r.data.items) || []).filter(p => p && spIdOk(p.id) && spUriOk(p.uri));
+            if (!itens.length) { el.innerHTML = '<div class="sp-note" style="padding:8px">Nenhuma playlist na sua biblioteca.</div>'; return; }
+            el.innerHTML = itens.map(p => {
+                const total = (p.items && p.items.total != null) ? p.items.total : (p.tracks && p.tracks.total);
+                const meu = spMe && p.owner && p.owner.id === spMe.id;
+                const listavel = meu || p.collaborative;
+                return spLinha({
+                    act: listavel ? 'open-pl' : 'play-ctx', uri: p.uri, id: p.id, name: p.name,
+                    img: p.images && p.images[p.images.length > 1 ? 1 : 0] && (p.images[p.images.length > 1 ? 1 : 0].url),
+                    titulo: p.name, sub: ((p.owner && p.owner.display_name) || '') + (total != null ? ' · ' + total + ' faixas' : ''),
+                    play: listavel ? { act: 'play-ctx', uri: p.uri } : null,
+                    atual: spState && spState.context === p.uri
+                });
+            }).join('');
+        }
+
+        async function spAbrirPlaylist(id, nome, uri, offset) {
+            const el = document.getElementById('sp-lista');
+            if (!el) return;
+            spPlAtual = { id, nome, uri };
+            if (!offset) el.innerHTML = `<div class="sp-voltar"><button type="button" onclick="spAba('playlists')" title="Voltar"><i class="fa-solid fa-arrow-left"></i></button><span>${escapeHtml(nome)}</span><button type="button" class="sp-smart" onclick="spSmartShuffle('${id}', '${escapeHtml(escapeJsString(nome))}', '${uri}')" title="Smart Shuffle (aproximado): embaralha sem repetir artista em sequência e mistura músicas novas dos mesmos artistas"><i class="fa-solid fa-wand-magic-sparkles"></i></button><button type="button" onclick="spTocar({ context_uri: '${uri}' })" title="Tocar tudo"><i class="fa-solid fa-play"></i></button></div><div id="sp-faixas"><div class="sp-note" style="padding:8px">Carregando faixas...</div></div>`;
+            const r = await spChamar('GET', `/v1/playlists/${id}/items?limit=100&offset=${offset}`);
+            const box = document.getElementById('sp-faixas');
+            if (!box) return;
+            if (!spOk(r)) { box.innerHTML = `<div class="sp-err" style="margin:8px">${escapeHtml(spMsgErro(r))}</div>`; return; }
+            const data = r.data || {};
+            const faixas = (data.items || []).map(it => it && (it.item || it.track)).filter(t => t && typeof t === 'object' && spUriOk(t.uri));
+            const html = faixas.map(t => spLinha({
+                act: 'play-in', uri: t.uri, ctx: uri, titulo: t.name,
+                sub: (t.artists || []).map(a => a.name).join(', '),
+                img: t.album && t.album.images && t.album.images[t.album.images.length > 1 ? 1 : 0] && t.album.images[t.album.images.length > 1 ? 1 : 0].url,
+                atual: spState && spState.track && spState.track.uri === t.uri
+            })).join('');
+            if (!offset) box.innerHTML = html || '<div class="sp-note" style="padding:8px">Playlist vazia.</div>';
+            else { const mais = document.getElementById('sp-mais'); if (mais) mais.remove(); box.insertAdjacentHTML('beforeend', html); }
+            if (data.next) box.insertAdjacentHTML('beforeend', `<button type="button" id="sp-mais" class="sp-btn ghost" onclick="spAbrirPlaylist('${id}', '${escapeHtml(escapeJsString(nome))}', '${uri}', ${offset + 100})">Carregar mais</button>`);
+        }
+
+        function spRenderBusca() {
+            const el = document.getElementById('sp-lista');
+            if (!el) return;
+            el.innerHTML = `<input id="sp-q" class="sp-input" placeholder="Buscar músicas, álbuns e playlists" spellcheck="false" autocomplete="off" oninput="spBuscaAgendar(this.value)"><div id="sp-res"></div>`;
+            const q = document.getElementById('sp-q'); if (q) q.focus();
+        }
+        function spBuscaAgendar(v) { clearTimeout(spBuscaT); spBuscaT = setTimeout(() => spBuscar(v), 450); }
+        async function spBuscar(v) {
+            const box = document.getElementById('sp-res');
+            if (!box) return;
+            v = String(v || '').trim();
+            if (v.length < 2) { box.innerHTML = ''; return; }
+            box.innerHTML = '<div class="sp-note" style="padding:8px">Buscando...</div>';
+            const r = await spChamar('GET', '/v1/search?q=' + encodeURIComponent(v) + '&type=track,album,playlist&limit=10');
+            if (!spOk(r)) { box.innerHTML = `<div class="sp-err" style="margin:8px">${escapeHtml(spMsgErro(r))}</div>`; return; }
+            const d = r.data || {};
+            const img = o => o && o.images && o.images[o.images.length > 1 ? 1 : 0] && o.images[o.images.length > 1 ? 1 : 0].url;
+            const tracks = ((d.tracks && d.tracks.items) || []).filter(t => t && spUriOk(t.uri));
+            const albums = ((d.albums && d.albums.items) || []).filter(a => a && spUriOk(a.uri));
+            const lists = ((d.playlists && d.playlists.items) || []).filter(p => p && spUriOk(p.uri));
+            let h = '';
+            if (tracks.length) h += '<div class="sp-sec">Músicas</div>' + tracks.map(t => spLinha({ act: 'play-track', uri: t.uri, titulo: t.name, sub: (t.artists || []).map(a => a.name).join(', '), img: img(t.album), atual: spState && spState.track && spState.track.uri === t.uri })).join('');
+            if (albums.length) h += '<div class="sp-sec">Álbuns</div>' + albums.map(a => spLinha({ act: 'play-ctx', uri: a.uri, titulo: a.name, sub: (a.artists || []).map(x => x.name).join(', '), img: img(a) })).join('');
+            if (lists.length) h += '<div class="sp-sec">Playlists</div>' + lists.map(p => spLinha({ act: 'play-ctx', uri: p.uri, titulo: p.name, sub: (p.owner && p.owner.display_name) || '', img: img(p) })).join('');
+            box.innerHTML = h || '<div class="sp-note" style="padding:8px">Nada encontrado.</div>';
+        }
+
+        function spMsgErro(r) {
+            if (!r) return 'Sem resposta do Spotify.';
+            if (r.status === 401) return 'Sessão expirada. Desconecte e conecte de novo.';
+            if (r.status === 403) return 'O Spotify recusou o acesso (403). Confira se o dono do app tem Premium e se a sua conta está em User Management.';
+            if (r.status === 429) return 'Muitas requisições ao Spotify. Aguarde ' + (r.retry || 'alguns') + ' segundos.';
+            if (r.status === 0) return r.message || 'Sem conexão com o Spotify.';
+            return 'Erro do Spotify (' + r.status + ').' + ((r.data && r.data.error && r.data.error.message) ? ' ' + r.data.error.message : '');
+        }
+
+        /* ---- player (iframe invisivel com o Web Playback SDK) ---- */
+        function spIniciarPlayer() {
+            const f = document.getElementById('sp-frame');
+            if (!f || f.dataset.on === '1' || !spInfo || !spInfo.playerUrl) return;
+            f.dataset.on = '1';
+            f.src = spInfo.playerUrl;
+            if (!window.__spMsg) { window.__spMsg = 1; window.addEventListener('message', spMensagem); }
+            if (!spTimer) spTimer = setInterval(spTick, 500);
+        }
+        function spCmd(cmd, v, ms) {
+            const f = document.getElementById('sp-frame');
+            if (!f || !f.contentWindow) return;
+            f.contentWindow.postMessage({ nxsp: 1, cmd, v, ms }, SP_ORIGEM);
+        }
+        function spMensagem(e) {
+            const f = document.getElementById('sp-frame');
+            if (!f || e.source !== f.contentWindow || e.origin !== SP_ORIGEM) return;
+            const m = e.data;
+            if (!m || !m.nxsp) return;
+            if (m.type === 'ready') { spDevice = String(m.device_id || ''); spAviso(''); }
+            else if (m.type === 'not_ready') { spDevice = ''; }
+            else if (m.type === 'state') { spState = m.state; spAtualizarNow(); }
+            else if (m.type === 'error') {
+                const k = m.kind;
+                spAviso(k === 'account_error' ? 'Esta conta não é Premium: o player embutido do Spotify exige Premium.'
+                    : k === 'authentication_error' ? 'Login do Spotify inválido ou expirado. Desconecte e conecte de novo.'
+                    : k === 'initialization_error' ? 'Este navegador embutido não suporta o player do Spotify (DRM): ' + (m.msg || '')
+                    : k === 'playback_error' ? 'Erro ao reproduzir: ' + (m.msg || '')
+                    : (m.msg || 'Erro no player do Spotify.'));
+            }
+        }
+        async function spTocar(corpo) {
+            if (!spDevice) { spAviso('O player do Cogni ainda está iniciando. Tente de novo em instantes.'); spIniciarPlayer(); return; }
+            spAviso('');
+            spCmd('activate');
+            // aplica a escolha de aleatorio ANTES de iniciar, para a playlist ja tocar embaralhada
+            if (spShufflePref !== null) await spChamar('PUT', '/v1/me/player/shuffle?state=' + spShufflePref + '&device_id=' + encodeURIComponent(spDevice));
+            const r = await spChamar('PUT', '/v1/me/player/play?device_id=' + encodeURIComponent(spDevice), corpo);
+            if (!spOk(r)) {
+                spAviso(r.status === 404 ? 'O Spotify não achou o player do Cogni. Feche e abra o painel para recriá-lo.'
+                    : r.status === 403 ? 'O Spotify recusou a reprodução (conta sem Premium ou item indisponível).'
+                    : spMsgErro(r));
+            }
+        }
+
+        function spShuffleAtivo() { return spShufflePref !== null ? spShufflePref : !!(spState && spState.shuffle); }
+        function spShuffleBotao() {
+            const b = document.getElementById('sp-shuf');
+            if (!b) return;
+            const on = spShuffleAtivo();
+            b.classList.toggle('on', on);
+            b.title = on ? 'Aleatório: ligado' : 'Aleatório: desligado';
+        }
+        async function spShuffle() {
+            const novo = !spShuffleAtivo();
+            spShufflePref = novo;
+            spShuffleBotao();
+            if (!spDevice) return;      // sem player ainda: vale a partir da proxima musica que tocar
+            const r = await spChamar('PUT', '/v1/me/player/shuffle?state=' + novo + '&device_id=' + encodeURIComponent(spDevice));
+            if (!spOk(r) && r.status !== 404) { spShufflePref = !novo; spShuffleBotao(); spAviso(spMsgErro(r)); }
+        }
+
+        /* ---- Smart Shuffle (aproximado) ----
+           O Smart Shuffle oficial do Spotify nao existe na API. Esta versao: (1) embaralha a
+           playlist sem repetir o mesmo artista em sequencia e (2) intercala musicas NOVAS
+           (fora da playlist) de artistas que voce ja tem nela. Toca ate 100 faixas por vez. */
+        const SP_SMART_MAX = 100;
+        function spEmbaralhar(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+        function spEspacarArtistas(faixas) {
+            const resto = faixas.slice(), saida = [];
+            while (resto.length) {
+                const recentes = saida.slice(-3).map(t => t.artist);
+                let i = resto.findIndex(t => !recentes.includes(t.artist));
+                if (i < 0) i = 0;
+                saida.push(resto.splice(i, 1)[0]);
+            }
+            return saida;
+        }
+        let spSmartOcupado = false;
+        async function spSmartShuffle(id, nome, uri) {
+            if (spSmartOcupado) return;
+            if (!spDevice) { spAviso('O player ainda está iniciando. Tente de novo em instantes.'); spIniciarPlayer(); return; }
+            spSmartOcupado = true;
+            try {
+                spAviso('Montando o Smart Shuffle...', true);
+                const todas = [];
+                for (let pg = 0, off = 0; pg < 4; pg++, off += 100) {
+                    const r = await spChamar('GET', `/v1/playlists/${id}/items?limit=100&offset=${off}`);
+                    if (!spOk(r)) { spAviso(spMsgErro(r)); return; }
+                    ((r.data && r.data.items) || []).forEach(it => {
+                        const t = it && (it.item || it.track);
+                        if (t && typeof t === 'object' && String(t.uri).startsWith('spotify:track:') && spUriOk(t.uri)) {
+                            const ids = (t.artists || []).map(a => a && a.id).filter(spIdOk);
+                            todas.push({ uri: t.uri, artist: ids[0] || t.uri, ids });
+                        }
+                    });
+                    if (!(r.data && r.data.next)) break;
+                }
+                if (todas.length < 3) { spAviso('A playlist precisa de pelo menos 3 músicas para o Smart Shuffle.'); return; }
+                const base = spEspacarArtistas(spEmbaralhar(todas.slice()));
+
+                // descobertas: uma faixa nova (fora da playlist) de artistas que ja estao nela
+                const conhecidas = new Set(todas.map(t => t.uri));
+                const artistas = spEmbaralhar([...new Set(todas.flatMap(t => t.ids))]);
+                const alvo = Math.min(10, Math.max(2, Math.round(base.length / 8)));
+                const novas = [];
+                for (const aid of artistas) {
+                    if (novas.length >= alvo) break;
+                    const ra = await spChamar('GET', `/v1/artists/${aid}/albums?include_groups=album,single&limit=10`);
+                    if (!spOk(ra)) { if (ra.status === 429) break; continue; }
+                    const albs = ((ra.data && ra.data.items) || []).filter(a => a && spIdOk(a.id));
+                    if (!albs.length) continue;
+                    const alb = albs[Math.floor(Math.random() * albs.length)];
+                    const rt = await spChamar('GET', `/v1/albums/${alb.id}/tracks?limit=20`);
+                    if (!spOk(rt)) continue;
+                    const cand = ((rt.data && rt.data.items) || []).filter(t => t && String(t.uri).startsWith('spotify:track:') && spUriOk(t.uri) && !conhecidas.has(t.uri) && !novas.includes(t.uri));
+                    if (cand.length) novas.push(cand[Math.floor(Math.random() * cand.length)].uri);
+                }
+
+                // intercala: 1 descoberta a cada ~4 faixas (a primeira so a partir da 4a)
+                const fila = base.slice(0, Math.max(1, SP_SMART_MAX - novas.length)).map(t => t.uri);
+                novas.forEach((u, i) => fila.splice(Math.min(fila.length, 3 + i * 5), 0, u));
+
+                // desliga o shuffle do Spotify: a ordem montada aqui e que vale
+                spShufflePref = false; spShuffleBotao();
+                await spChamar('PUT', '/v1/me/player/shuffle?state=false&device_id=' + encodeURIComponent(spDevice));
+                spCmd('activate');
+                const rp = await spChamar('PUT', '/v1/me/player/play?device_id=' + encodeURIComponent(spDevice), { uris: fila });
+                if (spOk(rp)) spAviso(`Smart Shuffle: ${fila.length - novas.length} músicas da playlist + ${novas.length} descobertas.`, true);
+                else spAviso(spMsgErro(rp));
+            } finally { spSmartOcupado = false; }
+        }
+
+        function spAtualizarNow() {
+            spShuffleBotao();
+            const t = spState && spState.track;
+            const img = document.getElementById('sp-np-img');
+            const src = t ? spImg(t.image) : '';
+            if (img) { if (src) { img.src = src; img.style.visibility = 'visible'; } else { img.removeAttribute('src'); img.style.visibility = 'hidden'; } }
+            document.getElementById('sp-np-title').textContent = t ? t.name : 'Nada tocando';
+            document.getElementById('sp-np-art').textContent = t ? (t.artists || []).join(', ') : '';
+            const pp = document.querySelector('#sp-pp i');
+            if (pp) pp.className = 'fa-solid ' + (spState && !spState.paused ? 'fa-pause' : 'fa-play');
+            document.getElementById('sp-t1').textContent = spFmt(spState && spState.duration);
+            spTick();
+        }
+        function spTick() {
+            if (!spState || !spState.track || spSeeking) return;
+            let pos = spState.position || 0;
+            if (!spState.paused && spState.ts) pos += Math.max(0, Date.now() - spState.ts);
+            pos = Math.min(pos, spState.duration || pos);
+            const r = document.getElementById('sp-seek');
+            if (r) r.value = spState.duration ? Math.round(pos / spState.duration * 1000) : 0;
+            document.getElementById('sp-t0').textContent = spFmt(pos);
+        }
+        function spSeekInput(v) {
+            spSeeking = true;
+            if (spState && spState.duration) document.getElementById('sp-t0').textContent = spFmt(v / 1000 * spState.duration);
+        }
+        function spSeekFim(v) {
+            if (spState && spState.duration) spCmd('seek', undefined, Math.round(v / 1000 * spState.duration));
+            setTimeout(() => { spSeeking = false; }, 400);
+        }
+
+
+        /* ---- Painel lateral da nota (estilo barra de apps): so abre um por vez ---- */
+        let ntPainelAtivo = null;
+        function ntAbrirPainel(nome) {
+            ntPainelAtivo = (ntPainelAtivo === nome) ? null : nome;
+            const painel = document.getElementById('nt-panel');
+            if (!painel) return;
+            painel.classList.toggle('open', !!ntPainelAtivo);
+            painel.querySelectorAll('.nt-card').forEach(c => c.classList.toggle('on', c.dataset.p === ntPainelAtivo));
+            document.querySelectorAll('.nt-rb').forEach(b => b.classList.toggle('on', b.dataset.b === ntPainelAtivo));
+        }
+        function ntAtualizarContadores(note) {
+            const set = (id, n) => { const el = document.getElementById(id); if (!el) return; el.textContent = n; el.classList.toggle('show', n > 0); };
+            set('rb-anexos', (note.resources || []).length);
+            set('rb-tarefas', (note.linkedTaskIds || []).filter(i => appData.tasks.some(t => t.id === i)).length);
+            set('rb-postits', (note.linkedPostitIds || []).filter(i => appData.postits.some(p => p.id === i)).length);
+        }
+
+        /* ---- Layout responsivo: menu principal e lista de notas recolhem em janela estreita ---- */
+        let _sbPref = null, _nlPref = null;
+        try { _sbPref = localStorage.getItem('cg-sb'); _nlPref = localStorage.getItem('cg-nl'); } catch (e) { }
+        function aplicarLayoutResponsivo() {
+            const w = window.innerWidth;
+            const sb = document.getElementById('cg-sidebar');
+            const nl = document.getElementById('notes-list-col');
+            if (sb) {
+                const rec = _sbPref !== null ? _sbPref === '1' : w < 1150;
+                sb.classList.toggle('sb-collapsed', rec);
+                const b = document.getElementById('sb-toggle');
+                if (b) b.title = rec ? 'Expandir menu' : 'Recolher menu';
+            }
+            if (nl) {
+                const rec = _nlPref !== null ? _nlPref === '1' : w < 1250;
+                nl.classList.toggle('nl-off', rec);
+                const b = document.getElementById('nl-toggle');
+                if (b) b.title = rec ? 'Mostrar lista de notas' : 'Ocultar lista de notas';
+            }
+        }
+        function toggleSidebar() {
+            const sb = document.getElementById('cg-sidebar');
+            _sbPref = sb.classList.contains('sb-collapsed') ? '0' : '1';
+            try { localStorage.setItem('cg-sb', _sbPref); } catch (e) { }
+            aplicarLayoutResponsivo();
+        }
+        function toggleListaNotas() {
+            const nl = document.getElementById('notes-list-col');
+            _nlPref = nl.classList.contains('nl-off') ? '0' : '1';
+            try { localStorage.setItem('cg-nl', _nlPref); } catch (e) { }
+            aplicarLayoutResponsivo();
+        }
+        window.addEventListener('resize', aplicarLayoutResponsivo);
+        document.addEventListener('DOMContentLoaded', aplicarLayoutResponsivo);
+        try { aplicarLayoutResponsivo(); } catch (e) { }
+
+        function alternarTarefaConcluida(id) {
+            const t = appData.tasks.find(x => x.id === id);
+            if (!t) return;
+            updateTaskStatus(id, t.status === 'Concluído' ? 'A Fazer' : 'Concluído');
+            const note = appData.notes.find(n => n.id === currentActiveNoteId);
+            if (note) renderNoteLinkedItems(note);
+        }
+
+        // Cria uma tarefa a partir do texto selecionado no editor da nota e
+        // ja a vincula a ela (task.noteId <-> note.linkedTaskIds).
+        function criarTarefaDaSelecao() {
+            if (!currentActiveNoteId) return;
+            const note = appData.notes.find(n => n.id === currentActiveNoteId);
+            if (!note) return;
+            const ed = document.getElementById('note-editor-content');
+            const sel = window.getSelection ? window.getSelection() : null;
+            let texto = '';
+            if (sel && sel.rangeCount && ed && ed.contains(sel.anchorNode) && ed.contains(sel.focusNode)) {
+                texto = sel.toString();
+            }
+            texto = texto.replace(/\s+/g, ' ').trim();
+            if (!texto) {
+                texto = (prompt('Nenhum texto selecionado. Título da nova tarefa:') || '').trim();
+                if (!texto) return;
+            }
+            const titulo = texto.length > 120 ? texto.slice(0, 117) + '…' : texto;
+            const id = 't-' + Date.now();
+            appData.tasks.push({
+                id, icon: 'fa-solid fa-book', title: titulo,
+                project: note.subject || '', priority: 'Média', status: 'A Fazer',
+                progress: 0, dueDate: '', subtasks: [], links: [], attachments: [],
+                noteId: note.id
+            });
+            if (!note.linkedTaskIds) note.linkedTaskIds = [];
+            note.linkedTaskIds.push(id);
+            triggerAutoSave();
+            renderNoteLinkedItems(note);
+            if (ntPainelAtivo !== 'tarefas') ntAbrirPainel('tarefas');
+            renderTasks();
+            renderSubjectsList();
+            renderDashboardStats();
+            updateCharts();
         }
 
         function vincularTarefaANota(taskId) {
@@ -6666,7 +7781,24 @@ def main():
         min_size=(900, 600),
         resizable=True
     )
-    webview.start(debug=False)
+    window.events.closing += (lambda: api._spotify_encerrar())
+    # Garantia de saida: nenhum processo fantasma prendendo o perfil do WebView2.
+    window.events.closed += (lambda: threading.Thread(
+        target=lambda: (time.sleep(5), os._exit(0)), daemon=True).start())
+    # O player do Spotify (iframe invisivel) precisa tocar sem clique direto nele.
+    _arg = "--autoplay-policy=no-user-gesture-required"
+    _atual = os.environ.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "")
+    if _arg not in _atual:
+        os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (_atual + " " + _arg).strip()
+    # Perfil PERSISTENTE (o padrao do pywebview e "privado"); mesma configuracao
+    # em que o player do Spotify foi validado no NEXUS.
+    perfil = os.path.join(os.path.dirname(api._base_dir), "webview")
+    try:
+        os.makedirs(perfil, exist_ok=True)
+    except Exception:
+        perfil = None
+    # COGNI_DEBUG=1 liga o DevTools (botao direito > Inspecionar).
+    webview.start(debug=(os.environ.get("COGNI_DEBUG") == "1"), private_mode=False, storage_path=perfil)
 
 if __name__ == '__main__':
     main()
