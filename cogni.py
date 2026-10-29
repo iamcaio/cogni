@@ -31,7 +31,7 @@ except Exception as e:
     show_native_error_dialog("Erro de Inicializacao - Cogni", err_msg)
     sys.exit(1)
 
-APP_VERSION = "v4.5.7"
+APP_VERSION = "v4.5.8"
 
 # Caminho legado: onde o Cogni gravava antes de existir login. Continua no
 # banco como copia de seguranca; nada e apagado dele.
