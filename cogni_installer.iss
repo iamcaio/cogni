@@ -21,7 +21,7 @@
 ; ===========================================================================
 
 #define MyAppName        "Cogni"
-#define MyAppVersion     "4.5.8"
+#define MyAppVersion     "4.6.9"
 #define MyAppPublisher   "COGNI"
 #define MyAppExeName     "COGNI.exe"
 
@@ -40,9 +40,10 @@ VersionInfoVersion={#MyAppVersion}
 DefaultDirName={localappdata}\Programs\{#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+; Sem OverridesAllowed: o update silencioso nunca pede elevacao (UAC) e nao falha
+; se o usuario negar. Instala sempre por usuario.
 
-OutputDir=dist_installer
+OutputDir=C:\Dev\cogni\dist_installer
 OutputBaseFilename=COGNI-Setup-{#MyAppVersion}
 SetupIconFile=cogni.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
@@ -53,9 +54,12 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 
-; Fecha o Cogni automaticamente durante um update silencioso e o reabre.
+; Fecha o Cogni durante um update silencioso. A REABERTURA e feita pelo [Run]
+; (RestartApplications=no): o app se encerra sozinho antes do instalador agir,
+; entao o Restart Manager nao tem o que reiniciar - era por isso que o Cogni
+; fechava e nao voltava. Mantido em "no" para nunca abrir duas vezes.
 CloseApplications=yes
-RestartApplications=yes
+RestartApplications=no
 CloseApplicationsFilter=*.exe
 
 [Languages]
@@ -86,11 +90,48 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserM
 Name: "{autodesktop}\{#MyAppName}";  Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "iamcaio.Cogni"; Tasks: desktopicon
 
 [Run]
-; skipifsilent: num update automatico o app e reaberto pelo RestartApplications,
-; nao por aqui. Sem isso o Cogni poderia abrir duas vezes.
+; Instalacao com assistente: caixa "Abrir o Cogni agora".
 Filename: "{app}\{#MyAppExeName}"; Description: "Abrir o {#MyAppName} agora"; Flags: nowait postinstall skipifsilent
+; Update automatico (/SILENT): reabre o Cogni sozinho ao terminar.
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait runasoriginaluser; Check: WizardSilent
+
+[Code]
+function WebView2Instalado: Boolean;
+var
+  pv, CH: String;
+begin
+  Result := False;
+  CH := 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
+  if RegQueryStringValue(HKLM32, CH, 'pv', pv) and (pv <> '') and (pv <> '0.0.0.0') then Result := True
+  else if RegQueryStringValue(HKLM64, CH, 'pv', pv) and (pv <> '') and (pv <> '0.0.0.0') then Result := True
+  else if RegQueryStringValue(HKCU, CH, 'pv', pv) and (pv <> '') and (pv <> '0.0.0.0') then Result := True;
+end;
+
+procedure InstalarWebView2;
+var
+  arq: String;
+  rc: Integer;
+begin
+  if WebView2Instalado then Exit;
+  try
+    DownloadTemporaryFile('https://go.microsoft.com/fwlink/p/?LinkId=2124703', 'MicrosoftEdgeWebview2Setup.exe', '', nil);
+    arq := ExpandConstant('{tmp}\MicrosoftEdgeWebview2Setup.exe');
+    Exec(arq, '/silent /install', '', SW_HIDE, ewWaitUntilTerminated, rc);
+  except
+  end;
+  if (not WebView2Instalado) and (not WizardSilent) then
+    MsgBox('O Cogni precisa do Microsoft Edge WebView2 Runtime e nao foi possivel instala-lo automaticamente.' + #13#10 +
+           'Instale em: https://go.microsoft.com/fwlink/p/?LinkId=2124703', mbInformation, MB_OK);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssInstall then InstalarWebView2;
+end;
 
 [UninstallDelete]
 ; Limpa apenas cache. Os DADOS em C:\COGNI\db e C:\COGNI\docs NAO sao
 ; apagados, de proposito.
 Type: filesandordirs; Name: "{app}\_internal\__pycache__"
+Type: filesandordirs; Name: "C:\COGNI\ui"
+Type: filesandordirs; Name: "{localappdata}\COGNI\ui"

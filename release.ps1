@@ -133,6 +133,12 @@ if (-not $DryRun) {
     Detalhe "[dry-run] python verificar.py"
 }
 
+# Nunca publica um exe que nao abre (foi o que aconteceu no 4.6.5).
+if (-not $DryRun) {
+    python build_tools\smoke_test.py dist\COGNI\COGNI.exe 15
+    if ($LASTEXITCODE -ne 0) { throw "Teste de fumaca FALHOU: o executavel nao abre. Nada foi publicado." }
+}
+
 # Le a versao DO CODIGO. Se divergir do parametro, o build nao aplicou.
 $py = Get-Content -Raw -Encoding UTF8 "cogni.py"
 if ($py -match 'APP_VERSION = "v([\d.]+)"') {
@@ -223,7 +229,7 @@ if ($origem) {
 # ---------------------------------------------------------------------------
 Etapa 5 "Release no repositorio publico ($RepoPublico)"
 
-$setup = "dist_installer\COGNI-Setup-$versaoReal.exe"
+$setup = "C:\Dev\cogni\dist_installer\COGNI-Setup-$versaoReal.exe"
 
 if (-not (Test-Path $setup)) {
     Aviso "instalador nao encontrado em $setup"
@@ -284,7 +290,7 @@ if (-not (Test-Path $setup)) {
 # ---------------------------------------------------------------------------
 Etapa 6 "Manifesto para o Firebase"
 
-$manifesto = "dist_installer\manifest-$versaoReal.json"
+$manifesto = "C:\Dev\cogni\dist_installer\manifest-$versaoReal.json"
 if (Test-Path $manifesto) {
     $conteudo = Get-Content -Raw $manifesto
     Write-Host ""

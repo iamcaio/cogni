@@ -327,6 +327,12 @@ $temCertifi = (Get-ChildItem "dist\COGNI" -Recurse -Filter "cacert.pem" `
 if ($temCertifi) { Detalhe "certifi/cacert.pem incluido: TLS verificavel OK" }
 else { Aviso "cacert.pem NAO encontrado. O auto-updater vai se recusar a instalar, e o LOGIN pode falhar. Rode: pip install certifi" }
 
+# Teste de fumaca: o exe PRECISA abrir. Compilar nao prova isso (o 4.6.5 saiu
+# quebrado por esse motivo). Se falhar, o build para aqui.
+Detalhe "teste de fumaca: abrindo o exe por 15s..."
+python build_tools\smoke_test.py dist\COGNI\COGNI.exe 15
+if ($LASTEXITCODE -ne 0) { throw "Teste de fumaca FALHOU: o executavel nao abre. Nada foi empacotado." }
+
 if ($SkipInstaller) {
     Write-Host "`nPronto (sem instalador). Teste: .\dist\COGNI\COGNI.exe" -ForegroundColor Green
     exit 0
@@ -361,7 +367,8 @@ Detalhe "ISCC: $iscc"
 & $iscc "cogni_installer.iss" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup retornou codigo $LASTEXITCODE." }
 
-$setup = "dist_installer\COGNI-Setup-$Version.exe"
+$DistInstaller = "C:\Dev\cogni\dist_installer"
+$setup = Join-Path $DistInstaller "COGNI-Setup-$Version.exe"
 if (-not (Test-Path $setup)) { throw "Inno Setup nao gerou $setup" }
 
 # ===========================================================================
@@ -390,8 +397,16 @@ $manifesto = [ordered]@{
 } | ConvertTo-Json -Depth 3
 
 [System.IO.File]::WriteAllText(
-    (Join-Path $PSScriptRoot "dist_installer\manifest-$Version.json"),
+    (Join-Path $DistInstaller "manifest-$Version.json"),
     $manifesto, $Utf8SemBom)
+
+# Notas da versao tambem em history/<versao>: quando "stable" avancar, quem
+# atualizar pulando versoes ainda ve o patch notes desta.
+$hist = [ordered]@{ notes = $notas } | ConvertTo-Json -Depth 3
+$vh = $Version.Replace(".", "_")
+[System.IO.File]::WriteAllText(
+    (Join-Path $DistInstaller "history-$Version.json"),
+    $hist, $Utf8SemBom)
 
 Write-Host ""
 Write-Host "=======================================================" -ForegroundColor Yellow
@@ -400,6 +415,7 @@ Write-Host "=======================================================" -Foreground
 Write-Host $manifesto
 Write-Host "=======================================================" -ForegroundColor Yellow
 Write-Host ""
+Write-Host "Opcional: cole dist_installer\history-$Version.json em /apps/cogni/_release/history/$vh" -ForegroundColor DarkGray
 Write-Host "Instalador:  $setup" -ForegroundColor Green
 Write-Host "Tamanho:     $([math]::Round($size/1MB,1)) MB" -ForegroundColor Green
 Write-Host ""

@@ -261,9 +261,6 @@ def checar_caminhos(fonte):
         ('namespace', r'APP_NAMESPACE = "([^"]+)"', 'cogni'),
         ('URL do banco', r'FIREBASE_DB_URL = "([^"]+)"',
          'https://cogni-data-default-rtdb.firebaseio.com'),
-        ('banco local', r"LOCAL_FALLBACK_PATH = r\"([^\"]+)\"",
-         r'C:\COGNI\db\database.json'),
-        ('documentos', r"DOCS_PATH = r\"([^\"]+)\"", r'C:\COGNI\docs'),
     ]
     for nome, padrao, esperado in pares:
         m = re.search(padrao, fonte)
@@ -273,6 +270,13 @@ def checar_caminhos(fonte):
             falha("%s = %r, esperado %r" % (nome, m.group(1), esperado))
         else:
             ok("%-14s %s" % (nome, m.group(1)))
+
+    if (re.search(r'candidatos = \[.*?r"C:\\COGNI"', fonte, re.S)
+            and 'os.path.join(_BASE_DADOS, "docs")' in fonte
+            and 'os.path.join(_BASE_DADOS, "db", "database.json")' in fonte):
+        ok("pastas de dados  C:\\COGNI (db, docs) com fallback em %LOCALAPPDATA%")
+    else:
+        falha("pastas de dados: C:\\COGNI com fallback nao encontrado")
 
     if re.search(r'/apps/\{APP_NAMESPACE\}/users/\{self\.uid\}/database', fonte):
         ok("caminho        /apps/cogni/users/<uid>/database")
@@ -298,7 +302,7 @@ def checar_updater(fonte):
         (r'len\(esperado\) != 64', "exige SHA-256 de 64 caracteres"),
         (r'obtido != esperado', "compara o hash do arquivo baixado"),
         (r'descartado\. Nada foi instalado', "descarta o arquivo se o hash falhar"),
-        (r'startswith\("https://"\)', "recusa URL nao-HTTPS"),
+        (r'startswith\(UPDATE_URL_PREFIXO\)', "so aceita URL do repositorio oficial (HTTPS)"),
         (r'UPDATE_TAMANHO_MAX', "limite de tamanho do download"),
         (r'ctx=_ssl_ctx_strict', "manifesto lido com TLS verificado"),
         (r'context=_ssl_ctx_strict', "download com TLS verificado"),

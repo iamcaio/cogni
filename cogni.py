@@ -31,21 +31,247 @@ except Exception as e:
     show_native_error_dialog("Erro de Inicializacao - Cogni", err_msg)
     sys.exit(1)
 
-APP_VERSION = "v4.5.8"
+# ---------------------------------------------------------------------------
+# BARRA UNICA (sem barra de titulo nativa do Windows)
+# Mesma tecnica do NEXUS: o WndProc responde WM_NCCALCSIZE com area cliente
+# = janela inteira, mantendo sombra e snap. Protecoes contra os bugs de la:
+#   * janela crescendo a cada minimizar/restaurar -> retangulo normal e
+#     guardado e reimposto (WM_SIZE) por ~1s;
+#   * maximizar cobrindo a barra de tarefas -> WM_GETMINMAXINFO/NCCALCSIZE
+#     limitam ao work area do monitor atual;
+#   * sem redimensionar -> WM_NCHITTEST nas bordas + alcas no HTML.
+# ---------------------------------------------------------------------------
+_CHROME_ATIVO = False
+_chrome_refs = []  # evita o GC do callback do WndProc
+_chrome_hooks = {}  # estado compartilhado com win_drag_*
+
+
+def _avisar_js_chrome(window):
+    try:
+        window.evaluate_js("window.cgwInit && window.cgwInit()")
+    except Exception:
+        pass
+
+
+def _instalar_chrome_unico(window):
+    """
+    Remove a barra de titulo nativa do Windows (area nao-cliente) mantendo
+    sombra, snap e redimensionamento. O header do app vira a unica barra.
+    """
+    global _CHROME_ATIVO
+    if _CHROME_ATIVO:  # 'shown' disparou de novo: nao encadeia o WndProc duas vezes
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.windll.user32
+        hwnd = int(window.native.Handle.ToInt64())
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        u32.GetWindowLongPtrW.restype = ctypes.c_void_p
+        u32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        u32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        u32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        u32.CallWindowProcW.restype = LRESULT
+        u32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        u32.DefWindowProcW.restype = LRESULT
+        u32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        WM_NCCALCSIZE, WM_NCHITTEST, WM_GETMINMAXINFO = 0x0083, 0x0084, 0x0024
+        WM_SIZE, WM_MOVE = 0x0005, 0x0003
+        WS_CAPTION = 0x00C00000
+        BORDA = 6
+        # Sem barra nativa o WinForms reaplica o tamanho a cada restauracao e a janela
+        # cresce; guardamos o retangulo normal e o reimpomos ao sair de min/max.
+        est = {"saved": None, "prev": 0, "lock": 0.0}
+
+        def _reimpor(h):
+            if est["saved"] and not u32.IsZoomed(h) and not u32.IsIconic(h):
+                x, y, w, hh = est["saved"]
+                u32.SetWindowPos(h, 0, x, y, w, hh, 0x0004 | 0x0010)
+
+        def _guardar(h):
+            # Ignora o que acontece logo apos restaurar: e o crescimento espurio.
+            if time.time() < est["lock"]:
+                return
+            if not u32.IsZoomed(h) and not u32.IsIconic(h):
+                r = wintypes.RECT()
+                u32.GetWindowRect(h, ctypes.byref(r))
+                est["saved"] = (r.left, r.top, r.right - r.left, r.bottom - r.top)
+        orig = u32.GetWindowLongPtrW(hwnd, -4)
+        u32.MonitorFromRect.restype = ctypes.c_void_p
+        u32.MonitorFromRect.argtypes = [ctypes.POINTER(wintypes.RECT), wintypes.DWORD]
+        u32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+
+        class WINDOWPLACEMENT(ctypes.Structure):
+            _fields_ = [("length", wintypes.UINT), ("flags", wintypes.UINT),
+                        ("showCmd", wintypes.UINT), ("ptMinPosition", wintypes.POINT),
+                        ("ptMaxPosition", wintypes.POINT), ("rcNormalPosition", wintypes.RECT)]
+        u32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+
+        class MINMAXINFO(ctypes.Structure):
+            _fields_ = [("ptReserved", wintypes.POINT), ("ptMaxSize", wintypes.POINT),
+                        ("ptMaxPosition", wintypes.POINT), ("ptMinTrackSize", wintypes.POINT),
+                        ("ptMaxTrackSize", wintypes.POINT)]
+
+        def _monitor_info(rect):
+            """MONITORINFO do monitor que contem `rect` (ou o mais proximo)."""
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            hmon = u32.MonitorFromRect(ctypes.byref(rect), 2)  # NEAREST
+            if not hmon or not u32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                return None
+            return mi
+
+        def _sem_borda(h):
+            # Fullscreen do pywebview/WinForms remove WS_CAPTION: nesse modo a janela
+            # deve cobrir o monitor inteiro, entao nao interferimos.
+            return not (u32.GetWindowLongPtrW(h, -16) or 0) & WS_CAPTION
+
+        def proc(h, msg, wp, lp):
+            try:
+                if msg == WM_SIZE:
+                    res = u32.CallWindowProcW(orig, h, msg, wp, lp)
+                    if wp in (1, 2):
+                        est["prev"] = wp
+                    elif wp == 0:
+                        if est["prev"] and est["saved"]:
+                            est["prev"] = 0
+                            est["lock"] = time.time() + 1.0
+                            _reimpor(h)
+                            # O WinForms reaplica o tamanho um pouco depois: reimpoe de novo.
+                            for atraso in (0.1, 0.3, 0.7):
+                                threading.Timer(atraso, _reimpor, (h,)).start()
+                        else:
+                            est["prev"] = 0
+                            _guardar(h)
+                    return res
+                if msg == WM_MOVE:
+                    res = u32.CallWindowProcW(orig, h, msg, wp, lp)
+                    if not est["prev"]:
+                        _guardar(h)
+                    return res
+                if msg == WM_GETMINMAXINFO and lp and not _sem_borda(h):
+                    # O WinForms primeiro preenche o tamanho MINIMO (min_size);
+                    # depois sobrescrevemos so a area de maximizar: exatamente a
+                    # area de trabalho do monitor atual.
+                    res = u32.CallWindowProcW(orig, h, msg, wp, lp)
+                    r = wintypes.RECT()
+                    u32.GetWindowRect(h, ctypes.byref(r))
+                    if r.left <= -30000 or u32.IsIconic(h):
+                        # Minimizada: usa o ultimo retangulo normal (monitor certo).
+                        wpl = WINDOWPLACEMENT()
+                        wpl.length = ctypes.sizeof(WINDOWPLACEMENT)
+                        if u32.GetWindowPlacement(h, ctypes.byref(wpl)):
+                            r = wpl.rcNormalPosition
+                        else:
+                            r = wintypes.RECT(0, 0, 1, 1)
+                    mi = _monitor_info(r)
+                    if mi:
+                        info = ctypes.cast(lp, ctypes.POINTER(MINMAXINFO))[0]
+                        info.ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left
+                        info.ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top
+                        info.ptMaxSize.x = mi.rcWork.right - mi.rcWork.left
+                        info.ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top
+                    return res
+                if msg == WM_NCCALCSIZE and wp:
+                    # Sem barra nativa: a area cliente e a janela inteira. Nao mexe
+                    # no retangulo quando minimizada ou em fullscreen sem borda.
+                    if u32.IsZoomed(h) and not u32.IsIconic(h) and not _sem_borda(h):
+                        # Maximizada: limita ao work area (respeita a barra de tarefas).
+                        # Usa o retangulo PROPOSTO para achar o monitor (nao o da janela).
+                        rc = ctypes.cast(lp, ctypes.POINTER(wintypes.RECT))
+                        mi = _monitor_info(rc[0])
+                        if mi:
+                            rc[0] = mi.rcWork
+                    return 0
+                if msg == WM_NCHITTEST and not u32.IsZoomed(h):
+                    x = ctypes.c_short(lp & 0xFFFF).value
+                    y = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                    wr = wintypes.RECT()
+                    u32.GetWindowRect(h, ctypes.byref(wr))
+                    esq, dir_ = x < wr.left + BORDA, x >= wr.right - BORDA
+                    top, bot = y < wr.top + BORDA, y >= wr.bottom - BORDA
+                    if top and esq: return 13
+                    if top and dir_: return 14
+                    if bot and esq: return 16
+                    if bot and dir_: return 17
+                    if esq: return 10
+                    if dir_: return 11
+                    if top: return 12
+                    if bot: return 15
+            except Exception:
+                pass
+            return u32.CallWindowProcW(orig, h, msg, wp, lp)
+
+        _guardar(hwnd)
+        _chrome_hooks["est"] = est
+        _chrome_hooks["guardar"] = _guardar
+        cb = WNDPROC(proc)
+        _chrome_refs.append(cb)
+        u32.SetWindowLongPtrW(hwnd, -4, ctypes.cast(cb, ctypes.c_void_p))
+        # NOMOVE|NOSIZE|NOZORDER|NOACTIVATE|FRAMECHANGED
+        u32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020)
+        _CHROME_ATIVO = True
+        # Se o JS ja passou do tempo de espera, avisa que a barra esta pronta.
+        threading.Thread(target=lambda: _avisar_js_chrome(window), daemon=True).start()
+        try:  # cantos arredondados do Win11
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[Cogni] Barra unica indisponivel: {e}")
+
+
+APP_VERSION = "v4.6.9"
 
 # Caminho legado: onde o Cogni gravava antes de existir login. Continua no
 # banco como copia de seguranca; nada e apagado dele.
 LEGACY_URL = "https://cogni-data-default-rtdb.firebaseio.com/database.json"
-LOCAL_FALLBACK_PATH = r"C:\COGNI\db\database.json"
+
+
+def _resolver_base_dados():
+    """Pasta-base dos dados do usuario. Tenta C:\\COGNI e, se a maquina nao
+    permitir escrita ali (notebook corporativo, C:\\ restrito), cai para
+    %LOCALAPPDATA%\\COGNI e, em ultimo caso, para a pasta temporaria."""
+    import tempfile
+    candidatos = [
+        # COGNI_BASE_DIR: usado so pelo teste de fumaca (build_tools\smoke_test.py),
+        # para abrir o app numa pasta descartavel sem tocar nos dados reais.
+        *([os.environ["COGNI_BASE_DIR"]] if os.environ.get("COGNI_BASE_DIR") else []),
+        r"C:\COGNI",
+        os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "COGNI"),
+        os.path.join(tempfile.gettempdir(), "COGNI"),
+    ]
+    for base in candidatos:
+        try:
+            os.makedirs(os.path.join(base, "db"), exist_ok=True)
+            teste = os.path.join(base, "db", ".escrita")
+            with open(teste, "w") as f:
+                f.write("1")
+            os.remove(teste)
+            return base
+        except Exception:
+            continue
+    return candidatos[0]
+
+
+_BASE_DADOS = _resolver_base_dados()
+LOCAL_FALLBACK_PATH = os.path.join(_BASE_DADOS, "db", "database.json")
 
 # Pasta de documentos do usuario. Criada no boot; o desinstalador nao a apaga.
-DOCS_PATH = r"C:\COGNI\docs"
+DOCS_PATH = os.path.join(_BASE_DADOS, "docs")
 
 # Onde o HTML da interface e escrito em disco antes de ser aberto na janela
 # (ver _escrever_ui_local). Fica junto com os outros dados do usuario, nao
 # dentro da pasta de instalacao - assim funciona mesmo que o app esteja
 # instalado num lugar sem permissao de escrita.
-UI_LOCAL_PATH = r"C:\COGNI\ui"
+UI_LOCAL_PATH = os.path.join(_BASE_DADOS, "ui")
 
 # ---------------------------------------------------------------------------
 # NOTIFICACOES DESKTOP (Windows Toast) - mesmo padrao validado no NEXUS.
@@ -280,6 +506,60 @@ UPDATE_CHECK_INTERVALO = 6 * 60 * 60
 UPDATE_TAMANHO_MAX = 400 * 1024 * 1024
 
 
+# Pagina publica de download: fallback quando a instalacao automatica nao e possivel.
+UPDATE_DOWNLOAD_PAGE = "https://github.com/iamcaio/cogni-dist/releases/latest"
+# So estes prefixos sao aceitos: um manifesto adulterado nao consegue apontar para outro host.
+UPDATE_URL_PREFIXO = "https://github.com/iamcaio/cogni-dist/releases/download/"
+UPDATE_PAGE_PREFIXO = "https://github.com/iamcaio/cogni-dist/"
+
+_SECOES_NOTAS = {
+    "adicionado": "added", "adicionados": "added", "novo": "added", "novidades": "added",
+    "added": "added", "new": "added",
+    "alterado": "changed", "alterados": "changed", "modificado": "changed",
+    "modificados": "changed", "melhorado": "changed", "melhorias": "changed", "changed": "changed",
+    "removido": "removed", "removidos": "removed", "excluido": "removed",
+    "excluidos": "removed", "excluído": "removed", "excluídos": "removed", "removed": "removed",
+    "corrigido": "fixed", "corrigidos": "fixed", "correcoes": "fixed",
+    "correções": "fixed", "fixed": "fixed",
+    "outros": "other", "outro": "other", "other": "other",
+}
+
+
+def _normalizar_notas(notas):
+    """Patch notes -> {added, changed, removed, fixed, other}: listas de str.
+
+    Aceita dict ja estruturado ou texto livre. No texto, uma linha terminada em
+    ':' (ex.: 'Adicionado:') abre a secao; '- item' adiciona. Linhas soltas vao
+    para 'other' (ou para a secao aberta).
+    """
+    out = {k: [] for k in ("added", "changed", "removed", "fixed", "other")}
+    try:
+        if isinstance(notas, list):  # o Firebase converte arrays
+            notas = "\n".join(str(x) for x in notas)
+        if isinstance(notas, dict):
+            for k, v in notas.items():
+                k2 = _SECOES_NOTAS.get(str(k).strip().lower(), str(k).strip().lower())
+                if k2 in out:
+                    itens = v if isinstance(v, list) else [v]
+                    out[k2] += [str(i).strip() for i in itens if str(i).strip()]
+            return out
+        atual = "other"
+        for linha in str(notas or "").replace("\r", "").split("\n"):
+            t = linha.strip()
+            if not t:
+                continue
+            cab = t.rstrip(":").strip().lstrip("#*").strip().lower()
+            if (t.endswith(":") or t.startswith("#")) and cab in _SECOES_NOTAS:
+                atual = _SECOES_NOTAS[cab]
+                continue
+            item = t.lstrip("-*• ").strip()
+            if item:
+                out[atual].append(item)
+    except Exception:
+        pass
+    return out
+
+
 def _versao_tupla(v):
     """'v4.5.1' -> (4, 5, 1). Trecho nao-numerico vira 0. Nunca levanta."""
     try:
@@ -288,11 +568,11 @@ def _versao_tupla(v):
         for p in limpo.split(".")[:4]:
             digitos = "".join(c for c in p if c.isdigit())
             partes.append(int(digitos) if digitos else 0)
-        while len(partes) < 3:
+        while len(partes) < 4:
             partes.append(0)
         return tuple(partes)
     except Exception:
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
 
 
 def _versao_maior(a, b):
@@ -333,6 +613,9 @@ class AutoUpdater:
                       "total": 0, "mensagem": ""}
         import threading
         self._lock = threading.Lock()
+        self._aplicar_pendente = False
+        self._pronto = None
+        self._pronto_info = None
 
     # ------------------------------------------------------------ estado
     def _set(self, **kw):
@@ -376,6 +659,7 @@ class AutoUpdater:
                     "message": "Nenhuma atualizacao publicada."}
 
         self.manifesto = corpo
+        self._limpar_obsoletos(corpo.get("version"))
         return self._resposta_do_manifesto()
 
     def _resposta_do_manifesto(self):
@@ -388,18 +672,147 @@ class AutoUpdater:
             "status": "update_available",
             "current": APP_VERSION,
             "latest": nova,
-            "notes": m.get("notes") or "",
+            "notes": _normalizar_notas(m.get("notes")),
+            "title": str(m.get("title") or "")[:120],
+            "released": str(m.get("released") or "")[:40],
             "size": m.get("size") or 0,
-            "mandatory": bool(m.get("mandatory")),
+            "mandatory": (m.get("mandatory") is True
+                          or str(m.get("mandatory")).strip().lower() == "true"),
             "hasHash": bool(m.get("sha256")),
+            "autoInstall": self._pode_instalar(m),
+            "downloadPage": self._pagina_download(m),
         }
 
+    @staticmethod
+    def _pagina_download(m):
+        u = str(m.get("downloadPage") or "").strip()
+        return u if u.startswith(UPDATE_PAGE_PREFIXO) else UPDATE_DOWNLOAD_PAGE
+
+    @staticmethod
+    def _pode_instalar(m):
+        u = str(m.get("url") or "").strip()
+        return (u.startswith(UPDATE_URL_PREFIXO) and u.lower().split("?")[0].endswith(".exe")
+                and len(str(m.get("sha256") or "").strip()) == 64
+                and _ssl_ctx_strict is not None)
+
+    def limpar_antigos(self):
+        """Apaga de updates\\ os instaladores ja instalados (versao <= atual) e
+        downloads parciais abandonados. Mantem versoes MAIORES (download pendente).
+        Se o arquivo estiver em uso (instalador ainda terminando), tenta no
+        proximo boot. Nunca levanta."""
+        import re
+        apagados = 0
+        try:
+            for nome in os.listdir(self.pasta):
+                caminho = os.path.join(self.pasta, nome)
+                if not os.path.isfile(caminho):
+                    continue
+                m = re.fullmatch(r"COGNI-Setup-(\d+\.\d+\.\d+)\.exe", nome, re.I)
+                velho = bool(m) and not _versao_maior(m.group(1), APP_VERSION)
+                parcial = nome.startswith("COGNI-Setup") and nome.lower().endswith(".part")
+                if velho or parcial:
+                    try:
+                        os.remove(caminho)
+                        apagados += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return apagados
+
+    def _limpar_obsoletos(self, versao_publicada):
+        """Apaga de updates\\ instaladores de versoes MAIORES que a atual mas diferentes
+        da que esta publicada agora (ex.: uma versao retirada por defeito). Assim um
+        arquivo antigo baixado em segundo plano nunca e instalado por engano."""
+        import re
+        try:
+            for nome in os.listdir(self.pasta):
+                m = re.fullmatch(r"COGNI-Setup-(\d+\.\d+\.\d+)\.exe", nome, re.I)
+                if not m:
+                    continue
+                v = m.group(1)
+                if _versao_maior(v, APP_VERSION) and _versao_tupla(v) != _versao_tupla(versao_publicada):
+                    try:
+                        os.remove(os.path.join(self.pasta, nome))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def notas_da_versao(self, versao):
+        """Patch notes de uma versao ja instalada: manifesto atual ou _release/history/<v>.
+
+        Devolve (notas, titulo, ok). ok=False quando NAO deu para consultar
+        (rede/TLS): quem chama nao deve dar a versao como "vista" nesse caso.
+        """
+        m = self.manifesto or {}
+        if _versao_tupla(m.get("version")) == _versao_tupla(versao):
+            return _normalizar_notas(m.get("notes")), str(m.get("title") or ""), True
+        if _ssl_ctx_strict is None:
+            return None, "", False
+        v = "_".join(str(x) for x in _versao_tupla(versao)[:3])
+        base = UPDATE_MANIFEST_URL.rsplit("/", 1)[0]
+        st, h = _http_json(f"{base}/history/{v}.json", timeout=10, ctx=_ssl_ctx_strict)
+        if st == 200 and isinstance(h, dict) and h.get("notes"):
+            return _normalizar_notas(h.get("notes")), str(h.get("title") or ""), True
+        # 200 com 'null' (no inexistente) ou negado: consulta funcionou, nao ha notas.
+        return None, "", st in (200, 401, 403, 404)
+
     # ---------------------------------------------------------- download
-    def baixar_e_aplicar(self):
-        """Roda em thread separada. Acompanhe por progresso()."""
+    def baixar_e_aplicar(self, aplicar=True):
+        """Roda em thread separada. Acompanhe por progresso().
+
+        aplicar=False: baixa e valida em segundo plano e para na fase 'ready';
+        instalar_pronto() inicia o instalador quando o usuario escolher.
+        Testa e marca a fase sob o lock: duas chamadas seguidas nao criam duas
+        threads, e um pedido de instalar durante um download silencioso e
+        lembrado (_aplicar_pendente) em vez de ser descartado.
+        """
         import threading
-        t = threading.Thread(target=self._fluxo, daemon=True)
-        t.start()
+        with self._lock:
+            fase = self._prog.get("fase")
+            if fase in ("downloading", "installing", "verified"):
+                if aplicar:
+                    self._aplicar_pendente = True
+                return {"status": "started"}
+            pronto = (fase == "ready" and aplicar)
+            if not pronto:
+                self._aplicar_pendente = bool(aplicar)
+                self._prog.update(fase="downloading", pct=0, recebido=0,
+                                  total=0, mensagem="Preparando...")
+        if pronto:
+            return self.instalar_pronto()
+        threading.Thread(target=self._fluxo, daemon=True).start()
+        return {"status": "started"}
+
+    def instalar_pronto(self):
+        """Instala o arquivo ja baixado, revalidando versao e hash antes."""
+        import hashlib
+        import threading
+        d = getattr(self, "_pronto", None)
+        info = getattr(self, "_pronto_info", None)
+        if not d or not info or not os.path.exists(d):
+            return {"status": "error", "message": "Nenhum instalador verificado."}
+        m = self.manifesto or {}
+        if info[0] != m.get("version") or info[1] != str(m.get("sha256") or "").strip().lower():
+            self._set(fase="error", mensagem="A versao publicada mudou desde o download. "
+                                              "Tente novamente.")
+            self._pronto = None
+            return {"status": "error", "message": "Versao publicada mudou."}
+        try:
+            h = hashlib.sha256()
+            with open(d, "rb") as f:
+                for bloco in iter(lambda: f.read(1048576), b""):
+                    h.update(bloco)
+            if h.hexdigest().lower() != info[1]:
+                raise ValueError("hash divergente")
+        except Exception:
+            self._set(fase="error", mensagem="O arquivo baixado nao passou na "
+                                              "verificacao de integridade.")
+            self._pronto = None
+            return {"status": "error", "message": "Integridade falhou."}
+        self._set(fase="installing", pct=100, mensagem="Instalando...")
+        threading.Thread(target=self._executar_instalador, args=(d,), daemon=True).start()
         return {"status": "started"}
 
     def _fluxo(self):
@@ -424,10 +837,11 @@ class AutoUpdater:
         url = (m.get("url") or "").strip()
         esperado = (m.get("sha256") or "").strip().lower()
 
-        if not url.lower().startswith("https://"):
+        if not (url.startswith(UPDATE_URL_PREFIXO)
+                and url.lower().split("?")[0].endswith(".exe")):
             self._set(fase="error",
-                      mensagem="O manifesto aponta para uma URL nao-HTTPS. "
-                               "Instalacao bloqueada.")
+                      mensagem="O manifesto aponta para um endereco nao confiavel. "
+                               "Instalacao bloqueada. Baixe manualmente.")
             return
         if len(esperado) != 64:
             self._set(fase="error",
@@ -496,24 +910,42 @@ class AutoUpdater:
             self._set(fase="error", mensagem=f"Falha ao salvar: {e}")
             return
 
+        self._pronto = destino
+        self._pronto_info = (m.get("version"), esperado)
+        if not self._aplicar_pendente:
+            self._set(fase="ready", pct=100,
+                      mensagem="Atualizacao baixada e verificada. Pronta para instalar.")
+            return
         self._set(fase="verified", pct=100,
                   mensagem="Integridade confirmada. Iniciando instalacao...")
         time.sleep(0.6)
+        self._executar_instalador(destino)
+
+    def _executar_instalador(self, destino):
+        import subprocess
 
         # /SILENT              -> sem assistente, so a barra de progresso
         # /CLOSEAPPLICATIONS   -> fecha o Cogni em execucao
-        # /RESTARTAPPLICATIONS -> reabre o Cogni ao terminar
+        # (reabrir o Cogni e feito pelo [Run] do instalador, ver cogni_installer.iss)
         # /NORESTART           -> nunca reinicia o Windows
         try:
             self._set(fase="installing", pct=100,
                       mensagem="O instalador vai abrir e o Cogni sera reiniciado.")
-            subprocess.Popen(
-                [destino, "/SILENT", "/CLOSEAPPLICATIONS",
-                 "/RESTARTAPPLICATIONS", "/NORESTART"],
+            # /SUPPRESSMSGBOXES -> nenhum dialogo pode prender o instalador
+            proc = subprocess.Popen(
+                [destino, "/SILENT", "/SUPPRESSMSGBOXES", "/CLOSEAPPLICATIONS",
+                 "/FORCECLOSEAPPLICATIONS", "/NORESTART"],
                 close_fds=True,
                 creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
             )
-            time.sleep(1.5)
+            time.sleep(2.0)
+            rc = proc.poll()
+            if rc is not None and rc != 0:
+                # O instalador ja morreu com erro: NAO fecha o app.
+                self._set(fase="error",
+                          mensagem=f"O instalador terminou com erro (codigo {rc}). "
+                                   "O Cogni continua aberto.")
+                return
             os._exit(0)
         except Exception as e:
             self._set(fase="error",
@@ -649,7 +1081,11 @@ def _mensagem_amigavel(codigo):
         "OPERATION_NOT_ALLOWED":
             "Login por e-mail/senha está temporariamente indisponível. Tente novamente mais tarde.",
         "TOKEN_EXPIRED": "Sessão expirada. Entre novamente.",
-    }.get(str(codigo), str(codigo))
+    }.get(str(codigo)) or (
+        "Sem conexão com a internet. Verifique a rede e tente novamente."
+        if any(t in str(codigo) for t in ("URLError", "getaddrinfo", "timed out",
+                                          "Errno", "ConnectionError", "RemoteDisconnected"))
+        else str(codigo))
 
 
 class CloudSync:
@@ -803,7 +1239,10 @@ class CloudSync:
                 self.expira_em = time.time() + 3300
             self._salvar_sessao()
             return self.id_token
-        self.ultimo_erro = _mensagem_amigavel((corpo or {}).get("error", {}).get("message", "TOKEN_EXPIRED"))
+        if st == 0:
+            self.ultimo_erro = "Sem conexão com a internet. Verifique a rede e tente novamente."
+        else:
+            self.ultimo_erro = _mensagem_amigavel((corpo or {}).get("error", {}).get("message", "TOKEN_EXPIRED"))
         return None
 
     # ------------------------------ dados ------------------------------ #
@@ -1299,11 +1738,15 @@ class CogniDesktopAPI:
 
         # Atualizacao automatica. A checagem roda em thread separada para nao
         # atrasar a abertura da janela nem um milissegundo.
+        self._sync_lock = threading.RLock()
         self._updater = AutoUpdater(self._base_dir)
         self._update_cache = None
         try:
-            import threading
             threading.Thread(target=self._checar_update_em_background,
+                             daemon=True).start()
+            threading.Thread(target=self._limpar_updates_antigos,
+                             daemon=True).start()
+            threading.Thread(target=self._loop_sync_pendente,
                              daemon=True).start()
         except Exception as e:
             print(f"[Cogni] Nao foi possivel iniciar a checagem de update: {e}")
@@ -1313,6 +1756,13 @@ class CogniDesktopAPI:
     # ------------------------------------------------------------------ #
     # Atualizacao automatica (expostos ao JS)
     # ------------------------------------------------------------------ #
+    def _limpar_updates_antigos(self):
+        try:
+            time.sleep(15)  # nao compete com a abertura do app
+            self._updater.limpar_antigos()
+        except Exception:
+            pass
+
     def _checar_update_em_background(self):
         """Espera o app abrir e so depois consulta o manifesto."""
         try:
@@ -1334,12 +1784,63 @@ class CogniDesktopAPI:
         except Exception as e:
             return {"status": "error", "message": str(e), "current": APP_VERSION}
 
-    def update_install(self):
-        """Inicia download, verificacao e instalacao. Acompanhe update_progress."""
+    def update_install(self, aplicar=True):
+        """Inicia download, verificacao e instalacao. Acompanhe update_progress.
+        aplicar=False so baixa/valida (fase 'ready'); update_install_ready instala."""
         try:
-            return self._updater.baixar_e_aplicar()
+            return self._updater.baixar_e_aplicar(bool(aplicar))
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
+    def update_install_ready(self):
+        try:
+            return self._updater.instalar_pronto()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def update_whats_new(self):
+        """Patch notes da versao recem-instalada (uma unica vez por versao).
+
+        Marcador em <dados>/last_version.txt. Primeira execucao: so grava,
+        sem popup. update_ack_whats_new() confirma que o usuario viu.
+        """
+        try:
+            arq = os.path.join(self._base_dir, "last_version.txt")
+            ant = ""
+            if os.path.exists(arq):
+                with open(arq, encoding="utf-8") as f:
+                    ant = f.read().strip()
+            if not ant:
+                with open(arq, "w", encoding="utf-8") as f:
+                    f.write(APP_VERSION)
+                return {"show": False}
+            if not _versao_maior(APP_VERSION, ant):
+                return {"show": False}
+            notas, titulo, ok = self._updater.notas_da_versao(APP_VERSION)
+            if not notas:
+                if ok:  # so marca como visto se a consulta funcionou
+                    with open(arq, "w", encoding="utf-8") as f:
+                        f.write(APP_VERSION)
+                return {"show": False}
+            return {"show": True, "version": APP_VERSION, "previous": ant,
+                    "notes": notas, "title": titulo}
+        except Exception as e:
+            return {"show": False, "message": str(e)}
+
+    def update_ack_whats_new(self):
+        try:
+            with open(os.path.join(self._base_dir, "last_version.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write(APP_VERSION)
+        except Exception:
+            pass
+        return {"status": "success"}
+
+    def update_open_download_page(self):
+        """Fallback manual: abre a pagina de download (so HTTPS do manifesto/constante)."""
+        u = self._updater._pagina_download(self._updater.manifesto or {})
+        webbrowser.open(u)
+        return {"status": "success", "url": u}
 
     def update_progress(self):
         try:
@@ -1375,6 +1876,113 @@ class CogniDesktopAPI:
             "motivo": _TLS_MOTIVO,
             "authSempreVerificado": True,
         }
+
+    def set_window(self, window):
+        self._window = window
+
+    # --- Controles da janela (barra unica) ---
+    def win_chrome(self):
+        return bool(_CHROME_ATIVO)
+
+    def _hwnd(self):
+        return int(self._window.native.Handle.ToInt64())
+
+    def win_minimize(self):
+        import ctypes
+        ctypes.windll.user32.ShowWindow(self._hwnd(), 6)
+
+    def win_toggle_maximize(self):
+        import ctypes
+        u = ctypes.windll.user32
+        h = self._hwnd()
+        u.ShowWindow(h, 9 if u.IsZoomed(h) else 3)
+        return bool(u.IsZoomed(h))
+
+    def win_is_maximized(self):
+        import ctypes
+        return bool(ctypes.windll.user32.IsZoomed(self._hwnd()))
+
+    def win_close(self):
+        try:
+            self._spotify_encerrar()
+        except Exception:
+            pass
+        self._window.destroy()
+
+    # Mover/redimensionar: o WebView2 engole o mouse na area cliente, entao o
+    # arraste e dirigido pelo JS (begin/step) lendo o cursor global aqui.
+    def _cur(self):
+        import ctypes
+        from ctypes import wintypes
+        pt = wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        return pt.x, pt.y
+
+    def _rect(self):
+        import ctypes
+        from ctypes import wintypes
+        r = wintypes.RECT()
+        ctypes.windll.user32.GetWindowRect(self._hwnd(), ctypes.byref(r))
+        return r.left, r.top, r.right, r.bottom
+
+    def win_drag_begin(self, edge=""):
+        self._drag = {"edge": edge, "cur": self._cur(), "rect": self._rect(), "restored": False}
+
+    def win_drag_step(self):
+        import ctypes
+        u = ctypes.windll.user32
+        d = getattr(self, "_drag", None)
+        if not d:
+            return
+        cx, cy = self._cur()
+        dx, dy = cx - d["cur"][0], cy - d["cur"][1]
+        l, t, r, b = d["rect"]
+        h = self._hwnd()
+        flags = 0x0004 | 0x0010  # NOZORDER | NOACTIVATE
+        if not d["edge"]:
+            if u.IsZoomed(h):
+                if abs(dx) + abs(dy) < 4:
+                    return
+                w0 = r - l
+                est = _chrome_hooks.get("est")
+                if est:  # sem retangulo antigo: o WndProc nao reimpoe nada
+                    est["saved"] = None
+                    est["lock"] = 0.0
+                u.ShowWindow(h, 9)  # restaura e recentra sob o cursor
+                l2, t2, r2, b2 = self._rect()
+                nl, nt = int(cx - (cx - l) / max(w0, 1) * (r2 - l2)), max(cy - 20, 0)
+                d["rect"] = (nl, nt, nl + (r2 - l2), nt + (b2 - t2))
+                d["cur"] = (cx, cy)
+                u.SetWindowPos(h, 0, nl, nt, 0, 0, flags | 0x0001)
+                return
+            u.SetWindowPos(h, 0, l + dx, t + dy, 0, 0, flags | 0x0001)  # NOSIZE
+            return
+        e = d["edge"]
+        try:  # minimo REAL em pixels fisicos (ja escalado por DPI pelo pywebview)
+            mn = self._window.native.MinimumSize
+            MINW, MINH = int(mn.Width), int(mn.Height)
+            if MINW < 200 or MINH < 150:
+                raise ValueError("min_size invalido")
+        except Exception:
+            try:
+                esc = u.GetDpiForWindow(h) / 96.0
+            except Exception:
+                esc = 1.0
+            MINW, MINH = int(900 * esc), int(600 * esc)
+        if "w" in e: l = min(l + dx, r - MINW)
+        if "e" in e: r = max(r + dx, l + MINW)
+        if "n" in e: t = min(t + dy, b - MINH)
+        if "s" in e: b = max(b + dy, t + MINH)
+        u.SetWindowPos(h, 0, l, t, r - l, b - t, flags)
+
+    def win_drag_end(self):
+        self._drag = None
+        try:  # registra a posicao final como o novo "tamanho normal"
+            g = _chrome_hooks.get("guardar")
+            if g:
+                g(self._hwnd())
+        except Exception:
+            pass
 
     def get_app_version(self):
         return APP_VERSION
@@ -1456,8 +2064,20 @@ class CogniDesktopAPI:
         except Exception:
             return 0
 
+    @staticmethod
+    def _tem_legado_local():
+        """So oferece importar o banco antigo em PCs que realmente tiveram o Cogni
+        pre-login (arquivo legado local). Em PC novo, ninguem recebe a oferta de
+        importar dados que nao sao seus."""
+        try:
+            return os.path.isfile(LOCAL_FALLBACK_PATH) and os.path.getsize(LOCAL_FALLBACK_PATH) > 2
+        except Exception:
+            return False
+
     def cloud_legacy_preview(self):
         """Informa se ha dados no caminho antigo, para o app poder perguntar."""
+        if not self._tem_legado_local():
+            return {"available": False}
         d = self._ler_legado()
         if not d:
             return {"available": False}
@@ -1471,6 +2091,8 @@ class CogniDesktopAPI:
         Copia /database para o espaco da conta atual. Acao EXPLICITA, disparada
         pelo usuario. O original em /database permanece intacto.
         """
+        if not self._tem_legado_local():
+            return {"status": "error", "message": "Nao ha dados antigos para importar."}
         d = self._ler_legado()
         if not d or self._peso(d) == 0:
             return {"status": "error", "message": "Nao ha dados antigos para importar."}
@@ -1509,6 +2131,161 @@ class CogniDesktopAPI:
         except Exception as e:
             print(f"[Python Cache] Falha ao preparar cache local: {e}")
 
+    # ------------------------------------------------------------------ #
+    # Sincronizacao OFFLINE-FIRST
+    #
+    # Regra de ouro: a edicao do usuario e gravada NO PC primeiro. Se o envio
+    # para o Firebase falhar (sem internet), a pasta da conta ganha uma marca
+    # "dirty" em sync_state.json (sobrevive a fechar o app). Enquanto a marca
+    # existir, a nuvem NUNCA sobrescreve o cache local; assim que a internet
+    # volta, o local e enviado. Se outro dispositivo alterou a nuvem nesse
+    # meio-tempo (carimbo _meta.updatedAt maior que o da ultima sincronizacao),
+    # os dois lados sao MESCLADOS por id (nada e perdido) e a nuvem anterior
+    # fica guardada em backups\remote-*.json.
+    # ------------------------------------------------------------------ #
+    def _estado_path(self):
+        return os.path.join(os.path.dirname(self.local_path), "sync_state.json")
+
+    def _estado_ler(self):
+        try:
+            with open(self._estado_path(), "r", encoding="utf-8") as f:
+                e = json.load(f)
+            return e if isinstance(e, dict) else None
+        except Exception:
+            return None
+
+    def _estado_gravar(self, **kw):
+        e = self._estado_ler() or {"dirty": False, "base": 0}
+        e.update(kw)
+        try:
+            os.makedirs(os.path.dirname(self._estado_path()), exist_ok=True)
+            tmp = self._estado_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(e, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._estado_path())
+        except Exception as ex:
+            print(f"[Cogni Sync] Nao foi possivel gravar o estado: {ex}")
+        return e
+
+    @staticmethod
+    def _stamp(d):
+        try:
+            return int(((d or {}).get("_meta") or {}).get("updatedAt") or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _sem_meta(d):
+        return {k: v for k, v in (d or {}).items() if k != "_meta"}
+
+    def _empurrar(self, d):
+        """Envia `d` com carimbo novo. Sucesso limpa a marca dirty."""
+        d = self._sem_meta(d)
+        stamp = int(time.time() * 1000)
+        d["_meta"] = {"updatedAt": stamp}
+        res = self._cloud.enviar(d)
+        if res.get("status") == "success":
+            self._estado_gravar(dirty=False, base=stamp)
+            self._ultimo_sync = time.strftime("%H:%M:%S")
+            return True, res
+        return False, res
+
+    def _backup_remoto(self, dados):
+        try:
+            pasta = os.path.join(os.path.dirname(self.local_path), "backups")
+            os.makedirs(pasta, exist_ok=True)
+            with open(os.path.join(pasta, "remote-%d.json" % int(time.time())), "w",
+                      encoding="utf-8") as f:
+                json.dump(dados, f, ensure_ascii=False)
+            antigos = sorted(x for x in os.listdir(pasta) if x.startswith("remote-"))
+            for x in antigos[:-5]:
+                os.remove(os.path.join(pasta, x))
+        except Exception as ex:
+            print(f"[Cogni Sync] Backup da nuvem falhou: {ex}")
+
+    @staticmethod
+    def _mesclar(local, remoto):
+        """Uniao por id. O local (edicoes pendentes) vence em itens com o mesmo id;
+        itens que so existem de um lado sao mantidos (nunca perde dado)."""
+        def chave(x):
+            return json.dumps(x, sort_keys=True, ensure_ascii=False)
+        out = {}
+        for k in list(remoto.keys()) + [k for k in local.keys() if k not in remoto]:
+            if k == "_meta":
+                continue
+            if k not in local:
+                out[k] = remoto[k]
+            elif k not in remoto:
+                out[k] = local[k]
+            else:
+                a, b = local[k], remoto[k]
+                if isinstance(a, list) and isinstance(b, list):
+                    if all(isinstance(x, dict) and "id" in x for x in a + b):
+                        ids = {x["id"] for x in a}
+                        out[k] = a + [x for x in b if x["id"] not in ids]
+                    else:
+                        vistos = {chave(x) for x in a}
+                        out[k] = a + [x for x in b if chave(x) not in vistos]
+                elif isinstance(a, dict) and isinstance(b, dict):
+                    out[k] = {**b, **a}
+                else:
+                    out[k] = a
+        return out
+
+    def _sincronizar_pendente(self, local_txt=None, permitir_merge=True):
+        """Tenta enviar o que ficou pendente. Devolve {status, text?}:
+        nothing | offline | needs_merge | synced | merged."""
+        with self._sync_lock:
+            e = self._estado_ler() or {}
+            if not e.get("dirty"):
+                return {"status": "nothing"}
+            if not (self._cloud.configurado and self._cloud.logado):
+                return {"status": "offline"}
+            txt = local_txt or self._load_local_cache()
+            try:
+                d_local = json.loads(txt) if txt else None
+            except Exception:
+                d_local = None
+            if not isinstance(d_local, dict):
+                return {"status": "nothing"}
+            remoto = self._cloud.baixar()
+            st = remoto.get("status")
+            if st not in ("ok", "empty"):
+                return {"status": "offline", "message": remoto.get("message", "")}
+            dados = remoto.get("data") if st == "ok" else None
+            mesclou = False
+            if dados and self._peso(dados) > 0 and self._stamp(dados) > int(e.get("base") or 0):
+                if not permitir_merge:
+                    return {"status": "needs_merge"}
+                self._backup_remoto(dados)
+                d_local = self._mesclar(self._sem_meta(d_local), self._sem_meta(dados))
+                mesclou = True
+            ok, res = self._empurrar(d_local)
+            if not ok:
+                return {"status": "offline", "message": res.get("message", "")}
+            texto = json.dumps(self._sem_meta(d_local), ensure_ascii=False)
+            if mesclou:
+                self._save_local_cache(texto)
+            return {"status": "merged" if mesclou else "synced", "text": texto}
+
+    def _loop_sync_pendente(self):
+        """Em segundo plano: a cada 30s, se ha algo pendente e a internet voltou, envia."""
+        while True:
+            time.sleep(30)
+            try:
+                e = self._estado_ler()
+                if e and e.get("dirty") and self._cloud.configurado and self._cloud.logado:
+                    self._sincronizar_pendente(permitir_merge=False)
+            except Exception:
+                pass
+
+    def cloud_sync_state(self):
+        """Para a interface mostrar 'pendente de envio' e saber quando sincronizou."""
+        e = self._estado_ler() or {}
+        return {"pending": bool(e.get("dirty")), "lastSync": self._ultimo_sync}
+
     def load_state_from_disk(self):
         """
         Le os dados do espaco do usuario logado: /apps/cogni/users/<uid>/database
@@ -1523,71 +2300,107 @@ class CogniDesktopAPI:
             # Sem conta: opera apenas com o cache local desta maquina.
             return self._load_local_cache() or "{}"
 
-        remoto = self._cloud.baixar()
+        with self._sync_lock:
+            estado = self._estado_ler()
 
-        if remoto.get("status") == "ok":
-            dados = remoto["data"]
-            local = self._load_local_cache()
-            try:
-                d_local = json.loads(local) if local else {}
-            except Exception:
-                d_local = {}
+            # Ha edicoes locais que ainda nao chegaram na nuvem: elas vem primeiro.
+            if estado and estado.get("dirty"):
+                r = self._sincronizar_pendente(permitir_merge=True)
+                if r["status"] in ("synced", "merged"):
+                    return r["text"]
+                return self._load_local_cache() or "{}"   # offline: preserva o local
 
-            # Um remoto mais pobre nunca substitui um local mais rico.
-            if self._peso(d_local) > self._peso(dados):
-                print("[Cogni] Cache local mais completo que a nuvem; enviando local.")
-                self._cloud.enviar(d_local)
-                return local
+            remoto = self._cloud.baixar()
 
-            texto = json.dumps(dados, ensure_ascii=False)
-            self._save_local_cache(texto)
-            self._ultimo_sync = time.strftime("%H:%M:%S")
-            return texto
-
-        if remoto.get("status") == "empty":
-            # Espaco novo desta conta. A unica semeadura automatica permitida e
-            # o cache LOCAL desta maquina: ele prova que este computador ja usava
-            # o Cogni. O caminho legado /database e compartilhado e NAO pode ser
-            # copiado sozinho, senao qualquer conta nova herdaria dados alheios.
-            local = self._load_local_cache()
-            if local and local.strip() not in ("null", "{}"):
+            if remoto.get("status") == "ok":
+                bruto = remoto["data"]
+                stamp = self._stamp(bruto)
+                dados = self._sem_meta(bruto)
+                local = self._load_local_cache()
                 try:
-                    d = json.loads(local)
-                    if self._peso(d) > 0:
-                        self._cloud.enviar(d)
-                        self._ultimo_sync = time.strftime("%H:%M:%S")
-                        return local
+                    d_local = json.loads(local) if local else {}
                 except Exception:
-                    pass
-            return "{}"
+                    d_local = {}
 
-        # Falha de rede ou permissao: segue com o cache local.
-        print(f"[Cogni] Nuvem indisponivel ({remoto.get('message','')}); usando cache local.")
-        return self._load_local_cache() or "{}"
+                # Nuvem VAZIA nunca apaga um local com conteudo. E, so na primeira
+                # vez com esta versao (sem sync_state), mantem a regra antiga de
+                # "local mais rico vence" para nao perder edicoes feitas antes.
+                primeira = estado is None
+                if (self._peso(d_local) > 0 and self._peso(dados) == 0) or \
+                        (primeira and self._peso(d_local) > self._peso(dados)):
+                    print("[Cogni] Cache local mais completo que a nuvem; enviando local.")
+                    self._empurrar(d_local)
+                    return local
+
+                texto = json.dumps(dados, ensure_ascii=False)
+                self._save_local_cache(texto)
+                self._estado_gravar(dirty=False, base=stamp)
+                self._ultimo_sync = time.strftime("%H:%M:%S")
+                return texto
+
+            if remoto.get("status") == "empty":
+                # Espaco novo desta conta. A unica semeadura automatica permitida e
+                # o cache LOCAL desta maquina: ele prova que este computador ja usava
+                # o Cogni. O caminho legado /database e compartilhado e NAO pode ser
+                # copiado sozinho, senao qualquer conta nova herdaria dados alheios.
+                local = self._load_local_cache()
+                if local and local.strip() not in ("null", "{}"):
+                    try:
+                        d = json.loads(local)
+                        if self._peso(d) > 0:
+                            self._empurrar(d)
+                            return local
+                    except Exception:
+                        pass
+                return "{}"
+
+            # Falha de rede ou permissao: segue com o cache local.
+            print(f"[Cogni] Nuvem indisponivel ({remoto.get('message','')}); usando cache local.")
+            return self._load_local_cache() or "{}"
 
     def save_state_to_disk(self, json_str):
         """
         Grava no cache local e envia para o espaco do usuario na nuvem.
+        Sem internet: fica salvo no PC, marcado como pendente, e e enviado
+        automaticamente quando a conexao voltar (ver _sincronizar_pendente).
         O caminho antigo /database NAO e mais escrito, mas continua preservado.
         """
-        self._save_local_cache(json_str)
+        with self._sync_lock:
+            self._save_local_cache(json_str)
 
-        if not (self._cloud.configurado and self._cloud.logado):
-            return {"status": "offline_saved", "mode": "local_only",
-                    "message": "Sem conta conectada."}
+            if not (self._cloud.configurado and self._cloud.logado):
+                return {"status": "offline_saved", "mode": "local_only",
+                        "message": "Sem conta conectada."}
 
-        try:
-            dados = json.loads(json_str)
-        except Exception as e:
-            return {"status": "error", "message": f"JSON invalido: {e}"}
+            try:
+                dados = json.loads(json_str)
+            except Exception as e:
+                return {"status": "error", "message": f"JSON invalido: {e}"}
+            if not isinstance(dados, dict):
+                return {"status": "error", "message": "Formato invalido."}
 
-        res = self._cloud.enviar(dados)
-        if res.get("status") == "success":
-            self._ultimo_sync = time.strftime("%H:%M:%S")
-            # Sem o caminho completo: ele contem o UID e nao deve circular.
-            return {"status": "success", "mode": "cloud", "at": self._ultimo_sync}
-        return {"status": "offline_saved", "mode": "local_only",
-                "message": res.get("message", "")}
+            antes = self._estado_ler() or {}
+            # Marca ANTES de tentar: se o app fechar no meio, nada se perde.
+            self._estado_gravar(dirty=True)
+
+            if antes.get("dirty"):
+                # Ja havia pendencia: nao sobrescreve a nuvem as cegas. Confere
+                # se outro dispositivo mexeu e mescla se preciso.
+                r = self._sincronizar_pendente(local_txt=json_str, permitir_merge=True)
+                if r["status"] == "synced":
+                    return {"status": "success", "mode": "cloud", "at": self._ultimo_sync}
+                if r["status"] == "merged":
+                    return {"status": "merged", "mode": "cloud", "data": r["text"],
+                            "at": self._ultimo_sync}
+                return {"status": "offline_saved", "mode": "local_only", "pending": True,
+                        "message": r.get("message", "")}
+
+            ok, res = self._empurrar(dados)
+            if ok:
+                # Sem o caminho completo: ele contem o UID e nao deve circular.
+                return {"status": "success", "mode": "cloud", "at": self._ultimo_sync}
+            return {"status": "offline_saved", "mode": "local_only", "pending": True,
+                    "message": res.get("message", "")}
 
     def _save_local_cache(self, json_str):
         self._ensure_local_cache_exists()
@@ -2010,6 +2823,49 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         .cg-year-cell { position:relative; width:100%; aspect-ratio:1/1; border-radius:2px; border:0 !important; cursor:default; transition:opacity .15s, transform .15s; }
         .cg-year-cell:not([class*="bg-"]) { background:#f3f4f6; }
         .cg-year-cell:hover { opacity:.7; }
+
+        /* ---- Atualizacao automatica: sino + popup de patch notes ---- */
+        #upd-btn { position:relative; display:none; align-items:center; justify-content:center; width:26px; height:26px; border-radius:9999px; background:#111827; color:#fff; border:0; cursor:pointer; font-size:12px; }
+        #upd-btn.on { display:inline-flex; }
+        #upd-btn .upd-dot { position:absolute; top:-2px; right:-2px; width:9px; height:9px; border-radius:9999px; background:#ef4444; border:2px solid #fff; animation:updPulse 1.8s infinite; }
+        @keyframes updPulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.25)} }
+        #upd-toast { position:fixed; z-index:10000; width:380px; max-width:calc(100vw - 16px); display:none; background:#fff; color:#1f2937; border:1px solid #e5e7eb; border-radius:10px; box-shadow:0 10px 30px rgba(0,0,0,.18); padding:14px 16px 12px; font-size:13px; }
+        #upd-toast.on { display:block; animation:updIn .18s ease-out; }
+        @keyframes updIn { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:none; } }
+        #upd-toast::before { content:""; position:absolute; top:-6px; left:14px; width:10px; height:10px; background:#fff; border-left:1px solid #e5e7eb; border-top:1px solid #e5e7eb; transform:rotate(45deg); }
+        #upd-row { display:flex; gap:10px; align-items:flex-start; padding-right:20px; }
+        #upd-row > i { color:#2563eb; font-size:15px; margin-top:1px; }
+        #upd-title { font-weight:600; line-height:1.35; }
+        #upd-x { position:absolute; top:8px; right:10px; border:0; background:transparent; color:#9ca3af; cursor:pointer; font-size:14px; line-height:1; }
+        #upd-x:hover { color:#374151; }
+        #upd-body { display:none; margin-top:10px; padding-top:10px; border-top:1px solid #e5e7eb; max-height:280px; overflow-y:auto; }
+        #upd-body.on { display:block; }
+        #upd-body .upd-ver { font-size:11px; color:#6b7280; margin-bottom:8px; }
+        .upd-sec { margin-bottom:12px; }
+        .upd-sec h4 { font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.05em; margin:0 0 5px; }
+        .upd-sec ul { margin:0; padding-left:18px; list-style:disc; }
+        .upd-sec li { margin:2px 0; line-height:1.4; }
+        .upd-added h4 { color:#059669; } .upd-changed h4 { color:#2563eb; } .upd-removed h4 { color:#dc2626; } .upd-fixed h4 { color:#d97706; } .upd-other h4 { color:#6b7280; }
+        #upd-foot { margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+        #upd-foot button { border:0; border-radius:6px; padding:6px 12px; font-size:12px; font-weight:600; cursor:pointer; }
+        .upd-pri { background:#2563eb; color:#fff; } .upd-pri:hover { background:#1d4ed8; }
+        .upd-sec-btn { background:#f3f4f6; color:#374151; } .upd-sec-btn:hover { background:#e5e7eb; }
+        #upd-bar { height:6px; background:#e5e7eb; border-radius:9999px; overflow:hidden; margin:8px 0 0; display:none; }
+        #upd-bar > div { height:100%; width:0; background:#111827; transition:width .25s; }
+        #upd-msg { font-size:12px; color:#6b7280; margin-top:8px; display:none; }
+        /* ---- Barra unica: botoes da janela (tema claro) ---- */
+        .cgw-wc { width:46px; display:flex; align-items:center; justify-content:center; color:#374151; background:transparent; border:0; cursor:default; }
+        .cgw-wc:hover { background:rgba(0,0,0,.07); }
+        .cgw-wc-close:hover { background:#e81123; color:#fff; }
+        #cgw-titlebar input, #cgw-titlebar button { -webkit-app-region:no-drag; }
+        #cgw-titlebar #global-search-input { user-select:text; }
+        /* ---- Pesquisa nos cadernos de notas ---- */
+        mark.nb-hit { background:#fde68a; color:inherit; border-radius:2px; padding:0 1px; }
+        .nb-res { display:block; width:100%; text-align:left; background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:7px 9px; cursor:pointer; transition:background .12s, border-color .12s; }
+        .nb-res:hover { background:#f9fafb; border-color:#d1d5db; }
+        .nb-res.ativa { border-color:#a5b4fc; background:#eef2ff; }
+        .nb-badge { display:inline-block; font-size:9px; font-weight:700; padding:1px 6px; border-radius:9999px; margin-top:4px; }
+        .nb-b-exata { background:#d1fae5; color:#047833; } .nb-b-todas { background:#dbeafe; color:#1d4ed8; } .nb-b-parcial { background:#fef3c7; color:#92400e; }
         #cg-tip { position:fixed; z-index:9999; background:#111827; color:#fff; font-size:11px; padding:5px 9px; border-radius:8px; white-space:nowrap; pointer-events:none; opacity:0; transition:opacity .12s; box-shadow:0 6px 16px rgba(0,0,0,.18); }
         .cg-year-months { display:flex; justify-content:space-between; padding:0 .5rem; margin-top:.5rem; font-size:10px; font-weight:500; letter-spacing:.1em; text-transform:uppercase; color:#9ca3af; }
         .cg-year-foot { display:flex; flex-wrap:wrap; align-items:center; gap:1rem; margin-top:1rem; font-size:11px; color:#9ca3af; }
@@ -2277,6 +3133,10 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                         class="w-full px-3 py-2 rounded-lg text-sm bg-gray-100 border border-gray-200 text-gray-700 hover:bg-gray-200 cursor-pointer transition">
                     Criar uma conta
                 </button>
+                <button id="gateLocal" onclick="gateModoLocal()" type="button"
+                        class="w-full text-[11px] text-gray-500 hover:text-gray-800 underline cursor-pointer pt-1">
+                    Continuar sem conta (dados só neste computador, sem sincronizar)
+                </button>
             </div>
 
             <p class="text-[11px] text-gray-400 text-center mt-4 leading-relaxed">
@@ -2287,7 +3147,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
 
     <!-- HEADER TOPBAR -->
-    <header class="h-9 bg-notion-sidebar border-b border-notion-border flex items-center justify-between px-3 text-xs text-notion-muted shrink-0 z-20">
+    <header id="cgw-titlebar" class="h-10 bg-notion-sidebar border-b border-notion-border flex items-center justify-between px-3 text-xs text-notion-muted shrink-0 z-20 select-none">
         <div class="flex items-center space-x-3">
             <div class="flex items-center space-x-2 font-semibold text-gray-800">
                 <i class="fa-solid fa-brain text-black text-sm"></i>
@@ -2298,6 +3158,11 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             <!-- Perfil: o avatar abre o modal de perfil. -->
             <button type="button" onclick="openProfileModal()" id="header-profile-btn" title="Perfil" class="shrink-0 rounded-full hover:opacity-80 transition cursor-pointer">
                 <span id="user-avatar-container" class="block"></span>
+            </button>
+
+            <!-- Atualizacao: so aparece quando HA versao nova (ou recem-instalada). -->
+            <button type="button" id="upd-btn" onclick="updAbrirModal()" title="Há uma atualização disponível">
+                <i class="fa-solid fa-arrow-down"></i><span class="upd-dot"></span>
             </button>
 
             <!-- Estado do banco na nuvem. -->
@@ -2326,7 +3191,23 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 <i class="fa-solid fa-file-import text-gray-400"></i><span>Importar</span>
             </button>
         </div>
+        <!-- Controles da janela: so aparecem se a barra nativa foi removida. -->
+        <div id="cgw-winctl" class="hidden items-stretch shrink-0" style="height:36px;margin:4px -12px 0 10px">
+            <button type="button" onclick="cgWin('win_minimize')" class="cgw-wc" title="Minimizar" aria-label="Minimizar"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor"/></svg></button>
+            <button type="button" onclick="cgWin('win_toggle_maximize')" class="cgw-wc" id="cgw-wc-max" title="Maximizar" aria-label="Maximizar"></button>
+            <button type="button" onclick="cgWin('win_close')" class="cgw-wc cgw-wc-close" title="Fechar" aria-label="Fechar"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10" stroke="currentColor"/></svg></button>
+        </div>
     </header>
+
+    <!-- Notificacao de atualizacao (estilo VS Code), ancorada no icone do header. -->
+    <div id="upd-toast" role="status" aria-live="polite">
+        <button type="button" id="upd-x" onclick="updFechar()" title="Fechar" aria-label="Fechar">&times;</button>
+        <div id="upd-row"><i class="fa-solid fa-circle-info"></i><div id="upd-title"></div></div>
+        <div id="upd-body"></div>
+        <div id="upd-msg"></div>
+        <div id="upd-bar"><div></div></div>
+        <div id="upd-foot"></div>
+    </div>
 
     <div class="flex-1 flex overflow-hidden relative">
         <!-- SIDEBAR -->
@@ -2643,6 +3524,19 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                             </button>
                             <button onclick="createNewNote()" class="text-xs bg-white hover:bg-gray-100 border border-notion-border px-2 py-1 rounded shadow-sm text-gray-700 transition">
                                 <i class="fa-solid fa-plus mr-1"></i> Nova
+                            </button>
+                        </div>
+                    </div>
+                    <div class="px-2 pt-2">
+                        <div class="relative">
+                            <i class="fa-solid fa-magnifying-glass absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 text-[11px] pointer-events-none"></i>
+                            <input type="text" id="notes-search-input" placeholder="Pesquisar nos cadernos..." autocomplete="off"
+                                   oninput="buscarNosCadernosDebounce()"
+                                   onkeydown="if(event.key==='Escape'){limparBuscaNotas();}"
+                                   class="w-full bg-white border border-notion-border rounded-md pl-7 pr-7 py-1.5 text-[11px] text-gray-700 focus:outline-none focus:border-indigo-300">
+                            <button type="button" id="notes-search-clear" onclick="limparBuscaNotas()" title="Limpar pesquisa"
+                                    class="hidden absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700 text-[11px]">
+                                <i class="fa-solid fa-xmark"></i>
                             </button>
                         </div>
                     </div>
@@ -3791,6 +4685,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
         /* ---------------- Tela de entrada ---------------- */
         let contaCogni = { configured: false, signedIn: false };
+        let modoLocal = false;
+        function gateModoLocal() { modoLocal = true; esconderGate(); loadStateFromDiskSafely(); }
 
         function mostrarGate() {
             const g = document.getElementById('loginGate');
@@ -3864,7 +4760,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 const t = new Date().toLocaleTimeString('en-US', {hour12:true,hour:'2-digit',minute:'2-digit',second:'2-digit'});
                 if (evento === 'salvo')      hora.innerText = `Enviado às ${t}`;
                 else if (evento === 'baixado') hora.innerText = `Atualizado às ${t}`;
-                else if (evento === 'offline') { hora.innerText = 'Offline (salvo local)'; hora.className = 'text-amber-600 font-sans'; }
+                else if (evento === 'offline') { hora.innerText = 'Sem internet · salvo neste PC'; hora.className = 'text-amber-600 font-sans'; if (barra) barra.title = 'Suas alterações estão salvas neste computador e serão enviadas para a nuvem quando a internet voltar.'; }
                 else if (!hora.innerText || hora.innerText.includes('Conectando')) hora.innerText = 'Sincronizado';
             }
         }
@@ -3925,7 +4821,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 if (window.pywebview && window.pywebview.api &&
                     typeof window.pywebview.api.cloud_status === 'function') {
                     contaCogni = await window.pywebview.api.cloud_status();
-                    if (contaCogni.configured && !contaCogni.signedIn) { pintarStatusNuvem(); mostrarGate(); return; }
+                    if (contaCogni.configured && !contaCogni.signedIn && !modoLocal) { pintarStatusNuvem(); mostrarGate(); return; }
                     esconderGate();
                     pintarStatusNuvem();
                 }
@@ -3956,6 +4852,208 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 });
             }
         }
+
+
+        /* ================================================================
+           ATUALIZACAO AUTOMATICA + PATCH NOTES
+           Silencioso: so mostra algo quando ha versao nova ou apos instalar.
+           Fluxo: checa no boot (Python, thread) -> sino + popup unico por
+           versao -> baixa e valida SHA-256 em segundo plano -> "Reiniciar e
+           instalar". Se nao der para instalar sozinho: link de download.
+           ================================================================ */
+        let updInfo = null, updWhatsNew = null, updPoll = null, updModo = null, updFase = 'idle', updNotasAbertas = false;
+        const UPD_SECOES = [['added','Adicionado'],['changed','Alterado'],['removed','Removido'],['fixed','Corrigido'],['other','Outros']];
+        const updApi = () => (window.pywebview && window.pywebview.api) || null;
+        const updEl = id => document.getElementById(id);
+
+        function updRenderNotas(n) {
+            return UPD_SECOES.filter(([k]) => n && n[k] && n[k].length).map(([k, t]) =>
+                `<div class="upd-sec upd-${k}"><h4>${t}</h4><ul>${n[k].map(i => `<li>${escapeHtml(i)}</li>`).join('')}</ul></div>`
+            ).join('') || '<p style="color:#6b7280">Sem detalhes publicados.</p>';
+        }
+        function updPosicionar() {
+            const t = updEl('upd-toast'), b = updEl('upd-btn').getBoundingClientRect();
+            t.style.top = (b.bottom + 8) + 'px';
+            const l = Math.min(b.left - 8, window.innerWidth - t.offsetWidth - 8);
+            t.style.left = Math.max(8, l) + 'px';
+        }
+        window.addEventListener('resize', () => { if (updEl('upd-toast').classList.contains('on')) updPosicionar(); });
+        document.addEventListener('mousedown', e => {
+            // clicar fora fecha (igual ao VS Code: some, o icone continua)
+            const t = updEl('upd-toast');
+            if (t.classList.contains('on') && !t.contains(e.target) && !e.target.closest('#upd-btn') && updFase !== 'downloading' && !(updInfo && updInfo.mandatory && updModo === 'update')) updFechar();
+        });
+        function updMsg(t, pct) {
+            const m = updEl('upd-msg'); m.textContent = t || ''; m.style.display = t ? 'block' : 'none';
+            const b = updEl('upd-bar'); b.style.display = pct == null ? 'none' : 'block'; b.firstElementChild.style.width = (pct || 0) + '%';
+        }
+        function updBotoes() {
+            const u = updInfo, btn = (cls, fn, txt) => `<button class="${cls}" onclick="${fn}">${txt}</button>`;
+            const notas = btn('upd-sec-btn', 'updToggleNotas()', 'Notas de Atualização');
+            let h = '';
+            if (updModo === 'whatsnew') h = notas + btn('upd-pri', 'updFechar()', 'Fechar');
+            else if (updFase === 'downloading' || updFase === 'installing') h = notas;
+            else if (updFase === 'ready') h = btn('upd-pri', 'updInstalarPronto()', 'Reiniciar e instalar') + notas;
+            else if (updFase === 'error') h = btn('upd-pri', 'updApi().update_open_download_page()', 'Baixar manualmente') + btn('upd-sec-btn', 'updFechar()', 'Depois') + notas;
+            else {
+                h = (u && u.autoInstall ? btn('upd-pri', 'updInstalar()', 'Instalar') : btn('upd-pri', 'updApi().update_open_download_page()', 'Baixar'))
+                    + (u && u.mandatory ? '' : btn('upd-sec-btn', 'updFechar()', 'Depois')) + notas;
+            }
+            updEl('upd-foot').innerHTML = h;
+        }
+        function updRender() {
+            const w = updModo === 'whatsnew', d = w ? updWhatsNew : updInfo;
+            if (!d) return;
+            updEl('upd-x').style.display = (!w && d.mandatory) ? 'none' : '';
+            updEl('upd-title').textContent = w ? `Cogni atualizado para ${d.version}.` : 'Há uma atualização disponível.';
+            updEl('upd-body').innerHTML = `<div class="upd-ver">${w ? 'Versão ' + escapeHtml(d.version) : 'Versão ' + escapeHtml(d.latest) + ' (você está na ' + escapeHtml(d.current) + ')'}${d.title ? ' · ' + escapeHtml(d.title) : ''}</div>` + updRenderNotas(d.notes);
+            updEl('upd-body').classList.toggle('on', updNotasAbertas);
+            updBotoes();
+            updPosicionar();
+        }
+        function updToggleNotas() { updNotasAbertas = !updNotasAbertas; updEl('upd-body').classList.toggle('on', updNotasAbertas); updPosicionar(); }
+        function updAbrir(modo) {
+            updModo = modo; updNotasAbertas = false;
+            updEl('upd-toast').classList.add('on');
+            updRender();
+        }
+        function updFechar() {
+            updEl('upd-toast').classList.remove('on');
+            if (updModo === 'whatsnew' && updApi()) { updApi().update_ack_whats_new(); updWhatsNew = null; if (!(updInfo && updInfo.status === 'update_available')) updEl('upd-btn').classList.remove('on'); }
+            if (updModo === 'update' && updInfo) sessionStorage.setItem('cogni_upd_visto', updInfo.latest);
+        }
+        // Clique no icone: abre/fecha a notificacao.
+        function updAbrirModal() {
+            if (updEl('upd-toast').classList.contains('on')) return updFechar();
+            if (updWhatsNew) return updAbrir('whatsnew');
+            if (updInfo && updInfo.status === 'update_available') return updAbrir('update');
+        }
+        const updMostrarWhatsNew = () => updAbrir('whatsnew');
+        const updMostrarUpdate = () => updAbrir('update');
+        async function updInstalar() {
+            updFase = 'downloading'; updBotoes(); updMsg('Preparando...', 0);
+            await updApi().update_install(true);
+            updAcompanhar();
+        }
+        function updInstalarPronto() {
+            updFase = 'installing'; updBotoes(); updMsg('Instalando — o Cogni vai reiniciar...', 100);
+            updApi().update_install_ready();
+        }
+        function updAcompanhar() {
+            clearInterval(updPoll);
+            updPoll = setInterval(async () => {
+                const p = await updApi().update_progress();
+                if (p.fase === 'downloading') { updFase = 'downloading'; updMsg(`Baixando... ${p.pct}%`, p.pct); }
+                else if (p.fase === 'verified' || p.fase === 'installing') { updFase = 'installing'; updMsg('Instalando — o Cogni vai reiniciar...', 100); }
+                else if (p.fase === 'ready') { clearInterval(updPoll); updFase = 'ready'; updMsg('Baixada e verificada.', 100); updBotoes(); }
+                else if (p.fase === 'error') {
+                    clearInterval(updPoll);
+                    // Download silencioso que falhou nao abre nada sozinho: so mostra se o aviso ja esta aberto.
+                    if (updEl('upd-toast').classList.contains('on')) { updFase = 'error'; updMsg(p.mensagem || 'Falha na atualização.'); updBotoes(); }
+                    else updFase = 'idle';
+                }
+            }, 500);
+        }
+        function updTratar(r, a, abrir) {
+            updEl('upd-btn').classList.add('on');
+            updEl('upd-btn').title = 'Há uma atualização disponível';
+            if (r.autoInstall && !r.mandatory) { a.update_install(false); updAcompanhar(); }   // baixa/valida em segundo plano
+            if (abrir && (r.mandatory || sessionStorage.getItem('cogni_upd_visto') !== r.latest)) updAbrir('update');
+            if (r.mandatory && r.autoInstall) updInstalar();
+        }
+        async function updIniciar() {
+            let tent = 0;
+            const t = setInterval(async () => {
+                const a = updApi();
+                if (!a || typeof a.update_cached !== 'function') { if (++tent > 100) clearInterval(t); return; }
+                const r = await a.update_cached();
+                if (!r) { if (++tent > 100) clearInterval(t); return; }   // checagem ainda em curso
+                clearInterval(t);
+                updInfo = r;
+                try { updWhatsNew = (await a.update_whats_new()) || null; if (updWhatsNew && !updWhatsNew.show) updWhatsNew = null; } catch (e) {}
+                if (updWhatsNew) {
+                    updEl('upd-btn').classList.add('on'); updAbrir('whatsnew');
+                    if (r.status === 'update_available') updTratar(r, a, false);   // nao perde a versao nova
+                    return;
+                }
+                if (r.status === 'update_available') updTratar(r, a, true);
+            }, 1000);
+        }
+        window.addEventListener('pywebviewready', updIniciar);
+        // Rechecagem periodica leve (a cada 6h, so se o app ficar aberto).
+        setInterval(async () => { const a = updApi(); if (!a || updInfo && updInfo.status === 'update_available') return;
+            try { const r = await a.update_check_now(); if (r && r.status === 'update_available') { updInfo = r; updTratar(r, a, true); } } catch (e) {} }, 6 * 60 * 60 * 1000);
+
+        // Barra unica: o header faz o papel da barra de titulo do Windows (igual ao NEXUS).
+        (function () {
+            const ICO_MAX = '<svg width="10" height="10" viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9" fill="none" stroke="currentColor"/></svg>';
+            const ICO_RES = '<svg width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 2.5v-2h7v7h-2M.5 2.5h7v7h-7z" fill="none" stroke="currentColor"/></svg>';
+            const api = () => window.pywebview && window.pywebview.api;
+            function setMax(m) {
+                document.querySelectorAll('.cgw-rz').forEach(z => { z.style.display = m ? 'none' : 'block'; });
+                const b = document.getElementById('cgw-wc-max');
+                if (b) { b.innerHTML = m ? ICO_RES : ICO_MAX; b.title = m ? 'Restaurar' : 'Maximizar'; }
+            }
+            window.cgWin = async function (fn) {
+                try { const r = await api()[fn](); if (fn === 'win_toggle_maximize') setMax(r); } catch (e) {}
+            };
+            window.cgwInit = async function () {
+                if (window._cgwOn) return;
+                try {
+                    // 'shown' do pywebview pode chegar depois do ready: tenta por ~10s
+                    // (e o Python tambem chama cgwInit quando a barra fica pronta).
+                    let ok = false;
+                    for (let i = 0; i < 50 && !ok; i++) {
+                        ok = await api().win_chrome();
+                        if (!ok) await new Promise(r => setTimeout(r, 200));
+                    }
+                    if (!ok || window._cgwOn) return;
+                    window._cgwOn = true;
+                    document.getElementById('cgw-winctl').classList.replace('hidden', 'flex');
+                    let busy = false;
+                    function arrastar(e, edge) {
+                        if (e.button !== 0) return;
+                        e.preventDefault();
+                        api().win_drag_begin(edge);
+                        const mv = () => { if (busy) return; busy = true; api().win_drag_step().finally(() => { busy = false; }); };
+                        const up = () => {
+                            window.removeEventListener('mousemove', mv, true);
+                            window.removeEventListener('mouseup', up, true);
+                            api().win_drag_end();
+                        };
+                        window.addEventListener('mousemove', mv, true);
+                        window.addEventListener('mouseup', up, true);
+                    }
+                    document.getElementById('cgw-titlebar').addEventListener('mousedown', function (e) {
+                        if (e.target.closest('button,a,input,select,textarea,#global-search-results,#cloudStatusBar,#upd-toast')) return;
+                        if (e.detail === 2) { cgWin('win_toggle_maximize'); return; }
+                        arrastar(e, '');
+                    });
+                    // Alcas de redimensionamento (bordas e cantos).
+                    const T = 4, C = 6;
+                    [['n', 'top:0;left:' + C + 'px;right:' + C + 'px;height:' + T + 'px;cursor:ns-resize'],
+                     ['s', 'bottom:0;left:' + C + 'px;right:' + C + 'px;height:' + T + 'px;cursor:ns-resize'],
+                     ['w', 'left:0;top:' + C + 'px;bottom:' + C + 'px;width:' + T + 'px;cursor:ew-resize'],
+                     ['e', 'right:0;top:' + C + 'px;bottom:' + C + 'px;width:' + T + 'px;cursor:ew-resize'],
+                     ['nw', 'top:0;left:0;width:' + C + 'px;height:' + C + 'px;cursor:nwse-resize'],
+                     ['ne', 'top:0;right:0;width:' + C + 'px;height:' + C + 'px;cursor:nesw-resize'],
+                     ['sw', 'bottom:0;left:0;width:' + C + 'px;height:' + C + 'px;cursor:nesw-resize'],
+                     ['se', 'bottom:0;right:0;width:' + C + 'px;height:' + C + 'px;cursor:nwse-resize']
+                    ].forEach(([edge, css]) => {
+                        const d = document.createElement('div');
+                        d.className = 'cgw-rz';
+                        d.style.cssText = 'position:fixed;z-index:2147483647;' + css;
+                        d.addEventListener('mousedown', e => arrastar(e, edge));
+                        document.body.appendChild(d);
+                    });
+                    const sync = async () => setMax(await api().win_is_maximized());
+                    window.addEventListener('resize', sync);
+                    sync();
+                } catch (e) {}
+            };
+            window.addEventListener('pywebviewready', cgwInit);
+        })();
+
 
         window.addEventListener('pywebviewready', () => {
             loadStateFromDiskSafely();
@@ -4001,6 +5099,30 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             return true;
         }
 
+        function aplicarEstadoNuvem(res, rotulo) {
+            if (!res || res === lastCloudJsonHash || String(res).trim() === "null") return false;
+            try {
+                const parsed = JSON.parse(res);
+                if (!parsed || typeof parsed !== 'object') return false;
+                lastCloudJsonHash = res;
+                appData = normalizeAppData(parsed);
+                renderUserProfile();
+                renderSubjectsList();
+                renderTasks();
+                renderFlashcardDecks();
+                renderNotesSidebar();
+                renderPostitsCanvas();
+                renderResources();
+                renderDashboardStats();
+                updateCharts();
+                pintarStatusNuvem(rotulo);
+                return true;
+            } catch (e) {
+                console.error("[Cogni Sync Error]:", e);
+                return false;
+            }
+        }
+
         function consultarNuvem(forcado) {
             if (!forcado && !podeConsultarNuvem()) return;
             if (!(window.pywebview && window.pywebview.api &&
@@ -4008,33 +5130,25 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
             sincronizando = true;
             window.pywebview.api.load_state_from_disk().then(res => {
-                if (res && res !== lastCloudJsonHash && res.trim() !== "null") {
-                    try {
-                        const parsed = JSON.parse(res);
-                        if (parsed && typeof parsed === 'object') {
-                            lastCloudJsonHash = res;
-                            appData = normalizeAppData(parsed);
-                            renderUserProfile();
-                            renderSubjectsList();
-                            renderTasks();
-                            renderFlashcardDecks();
-                            renderNotesSidebar();
-                            renderPostitsCanvas();
-                            renderResources();
-                            renderDashboardStats();
-                            updateCharts();
-
-                            pintarStatusNuvem('baixado');
-                        }
-                    } catch(e) {
-                        console.error("[Cogni Sync Error]:", e);
-                    }
-                }
+                aplicarEstadoNuvem(res, 'baixado');
             }).catch(() => {}).finally(() => { sincronizando = false; });
         }
 
         function startRealtimeCloudSync() {
             setInterval(() => consultarNuvem(false), CLOUD_POLL_MS);
+
+            // Pendencias offline: mostra "sem internet" enquanto houver algo por
+            // enviar e confirma quando o Python terminar de enviar em segundo plano.
+            let tinhaPendencia = false;
+            setInterval(async () => {
+                try {
+                    if (!contaCogni.signedIn || !(window.pywebview && window.pywebview.api &&
+                        typeof window.pywebview.api.cloud_sync_state === 'function')) return;
+                    const st = await window.pywebview.api.cloud_sync_state();
+                    if (st && st.pending) { tinhaPendencia = true; pintarStatusNuvem('offline'); }
+                    else if (tinhaPendencia) { tinhaPendencia = false; pintarStatusNuvem('salvo'); }
+                } catch (e) {}
+            }, 10000);
 
             // Voltou para a janela: busca novidades na hora, sem esperar os 30s.
             window.addEventListener('focus', () => {
@@ -4205,6 +5319,11 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             if (window.pywebview && window.pywebview.api) {
                 ultimaGravacaoLocal = Date.now();
                 window.pywebview.api.save_state_to_disk(jsonStr).then(res => {
+                    if (res && res.status === 'merged' && res.data) {
+                        // Voltou a internet e outro dispositivo tinha mexido: dados mesclados.
+                        aplicarEstadoNuvem(res.data, 'baixado');
+                        return;
+                    }
                     pintarStatusNuvem((res && res.status === 'success') ? 'salvo' : 'offline');
                 });
             }
@@ -5160,6 +6279,190 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             renderNotesSidebar();
         }
 
+/* NB-SEARCH START */
+        /* ================================================================
+           PESQUISA NOS CADERNOS DE NOTAS
+           Varre titulo + texto de todas as notas. Ignora maiusculas e acentos
+           ("anotacoes" acha "Anotações"). Com varias palavras mostra, em ordem:
+             1) frase identica ("anotações caderno" junto, nessa ordem);
+             2) todas as palavras, em qualquer posicao;
+             3) so algumas delas (a nota que tem apenas "caderno" ou so "anotações").
+           ================================================================ */
+        const _NB_ENT = { '&nbsp;': ' ', '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'", '&#039;': "'" };
+        const _nbTextoCache = new Map();
+
+        function _nbTexto(html) {
+            return String(html || '')
+                .replace(/<\s*(br|\/p|\/div|\/li|\/h[1-6]|\/tr)\b[^>]*>/gi, ' ')
+                .replace(/<[^>]+>/g, ' ')
+                .replace(/&(nbsp|amp|lt|gt|quot|#0?39);/g, m => _NB_ENT[m] || ' ')
+                .replace(/\s+/g, ' ').trim();
+        }
+        // Texto puro + versao normalizada, guardados por nota: so recalcula se o conteudo mudou.
+        function _nbCache(n) {
+            const c = _nbTextoCache.get(n.id);
+            if (c && c.src === n.content) return c;
+            const txt = _nbTexto(n.content);
+            const novo = { src: n.content, txt, nx: _nbNorm(txt) };
+            _nbTextoCache.set(n.id, novo);
+            return novo;
+        }
+        // Minusculas e sem acento, SEMPRE com o mesmo tamanho do original
+        // (cada caractere vira exatamente um): os indices servem para destacar o texto.
+        function _nbNorm(str) {
+            return String(str || '').replace(/[^ -~]/g, ch => {
+                const d = ch.normalize('NFD');
+                let base = '';
+                for (let i = 0; i < d.length; i++) {
+                    const k = d.charCodeAt(i);
+                    if (k < 768 || k > 879) base += d[i];   // descarta so as marcas de acento (U+0300 a U+036F)
+                }
+                const r = base.toLowerCase();
+                return r.length >= 1 ? r[0] : ch;
+            }).toLowerCase();
+        }
+        function _nbTermos(q) {
+            const orig = String(q || '').trim().split(/\s+/).filter(Boolean);
+            const rotulos = {};
+            orig.forEach(w => { rotulos[_nbNorm(w)] = rotulos[_nbNorm(w)] || w; });
+            const frase = _nbNorm(orig.join(' '));
+            let termos = [...new Set(frase.split(' ').filter(Boolean))];
+            const longos = termos.filter(t => t.length >= 2);
+            if (longos.length) termos = longos;   // ignora letras soltas ("a", "e") quando ha palavras de verdade
+            return { frase, termos, rotulos };
+        }
+        function _nbContar(h, t) {
+            let n = 0, i = 0;
+            while ((i = h.indexOf(t, i)) !== -1) { n++; i += t.length; }
+            return n;
+        }
+        function _nbBuscar(query, notas) {
+            const { frase, termos, rotulos } = _nbTermos(query);
+            if (!termos.length) return { frase, termos, rotulos, itens: [] };
+            const multi = termos.length > 1;
+            const itens = [];
+            for (const n of notas) {
+                const titulo = String(n.title || '');
+                const cache = _nbCache(n);
+                const texto = cache.txt, nx = cache.nx;
+                const nt = _nbNorm(titulo);
+                const fraseT = multi && nt.includes(frase), fraseX = multi && nx.includes(frase);
+                const achados = []; let score = 0;
+                for (const t of termos) {
+                    const ct = _nbContar(nt, t), cx = _nbContar(nx, t);
+                    if (ct || cx) { achados.push(t); score += (ct ? 20 : 0) + (cx ? 10 + Math.min(cx, 5) : 0); }
+                }
+                if (!achados.length) continue;
+                const todas = achados.length === termos.length;
+                if (todas) score += 30;
+                if (fraseT) score += 100;
+                if (fraseX) score += 60;
+                const tipo = (!multi || fraseT || fraseX) ? 'exata' : (todas ? 'todas' : 'parcial');
+                itens.push({ nota: n, titulo, texto, nt, nx, achados, score, tipo });
+            }
+            itens.sort((a, b) => b.score - a.score || a.titulo.localeCompare(b.titulo, 'pt-BR'));
+            return { frase, termos, rotulos, itens };
+        }
+        function _nbFaixas(norm, termos, frase) {
+            const f = [];
+            const add = t => { let i = 0; while (t && (i = norm.indexOf(t, i)) !== -1) { f.push([i, i + t.length]); i += t.length; } };
+            termos.forEach(add);
+            if (termos.length > 1) add(frase);
+            f.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+            const m = [];
+            for (const r of f) {
+                const u = m[m.length - 1];
+                if (u && r[0] <= u[1]) u[1] = Math.max(u[1], r[1]); else m.push([r[0], r[1]]);
+            }
+            return m;
+        }
+        // Escapa o texto e envolve os trechos achados em <mark>.
+        function _nbMarcar(texto, faixas, ini, fim) {
+            let out = '', pos = ini;
+            for (const [a, b] of faixas) {
+                if (b <= ini || a >= fim) continue;
+                const aa = Math.max(a, ini), bb = Math.min(b, fim);
+                out += escapeHtml(texto.slice(pos, aa)) + '<mark class="nb-hit">' + escapeHtml(texto.slice(aa, bb)) + '</mark>';
+                pos = bb;
+            }
+            return out + escapeHtml(texto.slice(pos, fim));
+        }
+        function _nbTrecho(it, termos, frase) {
+            const t = it.texto;
+            if (!t) return '';
+            const faixas = _nbFaixas(it.nx, termos, frase);
+            let centro = 0;
+            if (faixas.length) {
+                centro = faixas[0][0];
+                const p = termos.length > 1 ? it.nx.indexOf(frase) : -1;
+                if (p >= 0) centro = p;   // prefere o lugar onde a frase aparece inteira
+            }
+            let ini = Math.max(0, centro - 45);
+            if (ini > 0) { const sp = t.indexOf(' ', ini); if (sp !== -1 && sp - ini < 14) ini = sp + 1; }
+            const fim = Math.min(t.length, ini + 170);
+            return (ini > 0 ? '…' : '') + _nbMarcar(t, faixas, ini, fim) + (fim < t.length ? '…' : '');
+        }
+        function _nbCaminho(n) {
+            const ps = []; let a = n, g = 0;
+            while (a && a.parentId && g++ < 10) {
+                a = (appData.notes || []).find(x => x.id === a.parentId);
+                if (a) ps.unshift(a.title || 'Sem Título');
+            }
+            return ps.join(' › ');
+        }
+
+        function _notasBuscaAtiva() {
+            const i = document.getElementById('notes-search-input');
+            return !!(i && i.value.trim());
+        }
+        function renderResultadosBuscaNotas() {
+            const box = document.getElementById('notes-sidebar-list');
+            const input = document.getElementById('notes-search-input');
+            if (!box || !input) return;
+            const consulta = input.value;
+            const r = _nbBuscar(consulta, appData.notes || []);
+            if (!r.itens.length) {
+                box.innerHTML = `<div class="p-3 text-center text-[11px] text-gray-400">Nenhum caderno com "${escapeHtml(consulta.trim())}"</div>`;
+                return;
+            }
+            const topo = `<div class="px-1 pb-1 text-[10px] text-notion-muted">${r.itens.length} caderno${r.itens.length === 1 ? '' : 's'} encontrado${r.itens.length === 1 ? '' : 's'}</div>`;
+            box.innerHTML = topo + r.itens.slice(0, 50).map(it => {
+                const faixasT = _nbFaixas(it.nt, r.termos, r.frase);
+                const tituloHtml = it.titulo ? _nbMarcar(it.titulo, faixasT, 0, it.titulo.length) : 'Sem Título';
+                const trecho = _nbTrecho(it, r.termos, r.frase);
+                const caminho = _nbCaminho(it.nota);
+                const badge = it.tipo === 'exata'
+                    ? (r.termos.length > 1 ? 'Frase idêntica' : 'Palavra encontrada')
+                    : it.tipo === 'todas' ? 'Todas as palavras'
+                    : 'Só: ' + it.achados.map(t => escapeHtml(r.rotulos[t] || t)).join(', ');
+                return `
+                    <button type="button" class="nb-res ${it.nota.id === currentActiveNoteId ? 'ativa' : ''}" onclick="abrirResultadoBuscaNota('${it.nota.id}')">
+                        <div class="text-[12px] font-semibold text-gray-800 truncate"><i class="fa-regular fa-file-lines text-[11px] text-amber-500 mr-1"></i>${tituloHtml}</div>
+                        ${caminho ? `<div class="text-[10px] text-notion-muted truncate">${escapeHtml(caminho)}</div>` : ''}
+                        ${trecho ? `<div class="text-[11px] text-gray-600 mt-1 leading-snug break-words">${trecho}</div>` : ''}
+                        <span class="nb-badge nb-b-${it.tipo}">${badge}</span>
+                    </button>`;
+            }).join('');
+        }
+        let _nbTimer = null;
+        function buscarNosCadernosDebounce() {
+            const clr = document.getElementById('notes-search-clear');
+            if (clr) clr.classList.toggle('hidden', !_notasBuscaAtiva());
+            clearTimeout(_nbTimer);
+            _nbTimer = setTimeout(renderNotesSidebar, 120);
+        }
+        function limparBuscaNotas() {
+            const i = document.getElementById('notes-search-input');
+            if (i) i.value = '';
+            const clr = document.getElementById('notes-search-clear');
+            if (clr) clr.classList.add('hidden');
+            renderNotesSidebar();
+        }
+        function abrirResultadoBuscaNota(id) {
+            openNoteInTab(id);   // a pesquisa continua aberta para navegar entre os resultados
+        }
+        /* NB-SEARCH END */
+
         function renderNotesSidebar() {
             const container = document.getElementById('notes-sidebar-list');
             const bulkBtn = document.getElementById('btn-bulk-delete-notes');
@@ -5170,6 +6473,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 if (appData.selectedNoteIds.length > 0) bulkBtn.classList.remove('hidden');
                 else bulkBtn.classList.add('hidden');
             }
+
+            // Pesquisando: a lista vira os resultados da pesquisa.
+            if (_notasBuscaAtiva()) { renderResultadosBuscaNotas(); return; }
 
             const raizes = appData.notes.filter(n => !n.parentId);
             // Soltar sobre o fundo da lista (fora de qualquer nota) volta a
@@ -7768,8 +9074,53 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 </html>
 """
 
+def _webview2_instalado():
+    """True se o Microsoft Edge WebView2 Runtime esta instalado."""
+    try:
+        import winreg
+        guid = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+        locais = (
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients" + "\\" + guid),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\EdgeUpdate\Clients" + "\\" + guid),
+            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\EdgeUpdate\Clients" + "\\" + guid),
+        )
+        for hive, caminho in locais:
+            try:
+                with winreg.OpenKey(hive, caminho) as k:
+                    pv, _ = winreg.QueryValueEx(k, "pv")
+                    if pv and pv != "0.0.0.0":
+                        return True
+            except OSError:
+                continue
+        return False
+    except Exception:
+        return True  # em duvida, deixa tentar abrir
+
+
 def main():
+    try:
+        _main_interno()
+    except Exception:
+        show_native_error_dialog(
+            "Cogni - erro ao iniciar",
+            "Nao foi possivel iniciar o Cogni.\n\n" + traceback.format_exc()[-900:])
+
+
+def _main_interno():
     _registrar_identidade_windows()
+    if not _webview2_instalado():
+        try:
+            import ctypes
+            r = ctypes.windll.user32.MessageBoxW(
+                0,
+                "O Cogni precisa do Microsoft Edge WebView2 Runtime, que nao foi "
+                "encontrado neste computador.\n\nAbrir a pagina de download agora?",
+                "Cogni", 0x24)
+            if r == 6:
+                webbrowser.open("https://go.microsoft.com/fwlink/p/?LinkId=2124703")
+        except Exception:
+            pass
+        return
     api = CogniDesktopAPI()
     index_uri = _escrever_ui_local('index.html', HTML_CONTENT.replace('__APP_VERSION__', APP_VERSION))
     window = webview.create_window(
@@ -7781,6 +9132,8 @@ def main():
         min_size=(900, 600),
         resizable=True
     )
+    api.set_window(window)
+    window.events.shown += (lambda: _instalar_chrome_unico(window))
     window.events.closing += (lambda: api._spotify_encerrar())
     # Garantia de saida: nenhum processo fantasma prendendo o perfil do WebView2.
     window.events.closed += (lambda: threading.Thread(
@@ -7798,7 +9151,7 @@ def main():
     except Exception:
         perfil = None
     # COGNI_DEBUG=1 liga o DevTools (botao direito > Inspecionar).
-    webview.start(debug=(os.environ.get("COGNI_DEBUG") == "1"), private_mode=False, storage_path=perfil)
+    webview.start(gui='edgechromium', debug=(os.environ.get("COGNI_DEBUG") == "1"), private_mode=False, storage_path=perfil)
 
 if __name__ == '__main__':
     main()
