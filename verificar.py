@@ -283,6 +283,12 @@ def checar_caminhos(fonte):
     else:
         falha("o caminho do no de dados nao segue /apps/cogni/users/<uid>/database")
 
+    mu = re.search(r'APP_UPDATE_VERSION = "v(\d+)\.(\d+)\.(\d+)"', fonte)
+    if mu and tuple(int(x) for x in mu.groups()) > (4, 6, 9):
+        ok("versao de atualizacao  v%s.%s.%s (maior que as instalacoes antigas 4.6.x)" % mu.groups())
+    else:
+        falha("APP_UPDATE_VERSION ausente ou <= 4.6.9: instalacoes antigas nao receberiam a atualizacao")
+
     if re.search(r'_release/\{UPDATE_CHANNEL\}', fonte):
         ok("manifesto      /apps/cogni/_release/<canal>")
     else:

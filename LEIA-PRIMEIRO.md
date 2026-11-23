@@ -129,3 +129,28 @@ Nesta conversa, cinco ferramentas minhas tiveram defeito, e nas cinco vezes
 foi a **execução** que revelou — nunca a revisão. Trate tudo que eu entregar
 para o Cogni como revisado, não testado, e rode os verificadores antes de
 confiar.
+
+---
+
+## Assistente de IA (Firebase AI Logic + Gemini)
+
+Botão flutuante no canto inferior direito. A IA roda na nuvem do Google; o app
+só envia texto. Ela **não grava sozinha**: propõe alterações (criar matérias,
+tarefas, cadernos, mapas mentais, eventos do calendário e flashcards; atualizar status/prioridade/prazo; excluir tarefas) e você clica em
+**Aplicar** ou **Descartar**.
+
+Antes de funcionar, faça uma vez no Firebase Console:
+
+1. **Build > AI Logic > Get started** e escolha **Gemini Developer API**
+   (plano Spark serve para começar; o provedor ativa a API "Firebase AI Logic").
+2. Em **Google Cloud > APIs e serviços > Credenciais**, abra a chave usada em
+   `FIREBASE_API_KEY`. Se ela tiver "Restrições de API", inclua
+   **Firebase AI Logic API** (`firebasevertexai.googleapis.com`).
+3. Confira `FIREBASE_PROJECT_ID` e `AI_MODEL` no topo da seção de nuvem do
+   `cogni.py` (o modelo padrão é `gemini-3.8-flash`; troque se for aposentado).
+
+Segurança: a chave é a mesma pública do app, então qualquer pessoa com ela
+consegue chamar o Gemini na SUA cota. Em **AI Logic > Configurações** defina
+limites de uso/orçamento e alertas de cobrança. O App Check protegeria mais,
+mas não há provedor simples para app desktop. O app só chama a IA com conta
+conectada e limita 20 chamadas/minuto, mas isso não impede abuso externo.

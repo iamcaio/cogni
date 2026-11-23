@@ -290,6 +290,26 @@ explicitamente e dá o comando para instalar.
 | `-OnlyInstaller` | Reaproveita o `dist\COGNI` já compilado |
 | `-OnlyVersion` | Só sincroniza a versão |
 | `-BaseUrl` | Sobrescreve a URL do manifesto |
+| `-UpdateVersion` | Versão interna de atualização (veja abaixo) |
+
+#### Duas versões: a pública e a de atualização
+
+A versão **pública** (`-Version`, por exemplo `0.1.0`) é a que o usuário vê: tela,
+nome do instalador e tag no GitHub. O app recomeçou em `0.1.0`.
+
+O auto-updater só oferece uma versão **maior** que a instalada. As instalações
+antigas estão em `4.6.x`, então o manifesto usa uma segunda versão, **interna**
+(`-UpdateVersion`, por exemplo `4.7.0`), que **nunca pode diminuir** e precisa
+subir a cada release:
+
+```powershell
+.\build.ps1 -Version 0.1.0 -UpdateVersion 4.7.0 -Notes "Primeira versao"
+.\build.ps1 -Version 0.1.1 -UpdateVersion 4.7.1 -Notes "Correcoes"
+```
+
+No manifesto: `version` = interna (o app compara este campo) e `displayVersion`
+= pública (é o que aparece na notificação). Esquecer de subir `-UpdateVersion` faz
+o app dizer "está atualizado" e ninguém recebe a atualização.
 
 ### 3.3 Teste antes de publicar
 

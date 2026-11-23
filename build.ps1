@@ -42,6 +42,9 @@
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [string]$Notes = "",
+    # Versao interna de atualizacao (X.Y.Z). So o auto-updater a usa; precisa continuar
+    # maior que a das instalacoes antigas. Omitido = mantem o valor atual do cogni.py.
+    [string]$UpdateVersion = "",
     [switch]$SkipInstaller,
     [switch]$OnlyVersion,
     [switch]$OnlyInstaller,
@@ -55,6 +58,9 @@ function Etapa($n, $txt) { Write-Host "`n[$n] $txt" -ForegroundColor Cyan }
 function Detalhe($txt)   { Write-Host "    $txt" -ForegroundColor DarkGray }
 function Aviso($txt)     { Write-Host "    $txt" -ForegroundColor Yellow }
 
+if ($UpdateVersion -and $UpdateVersion -notmatch '^\d+\.\d+\.\d+$') {
+    throw "UpdateVersion deve ser X.Y.Z. Recebido: '$UpdateVersion'"
+}
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "Versao deve ser X.Y.Z (ex: 4.5.1). Recebido: '$Version'"
 }
@@ -249,6 +255,11 @@ $dotted = "$Version.0"
 # --- Monta TUDO na memoria primeiro. So depois grava. ---
 $py = Read-TextFile "cogni.py"
 $py = Invoke-Regex $py 'APP_VERSION = "v[\d\.]+"' "APP_VERSION = `"v$Version`"" 'cogni.py APP_VERSION'
+if ($UpdateVersion) {
+    $py = Invoke-Regex $py 'APP_UPDATE_VERSION = "v[\d\.]+"' "APP_UPDATE_VERSION = `"v$UpdateVersion`"" 'cogni.py APP_UPDATE_VERSION'
+}
+$updEfetiva = ([regex]'APP_UPDATE_VERSION = "v([\d\.]+)"').Match($py).Groups[1].Value
+if (-not $updEfetiva) { throw "APP_UPDATE_VERSION nao encontrado no cogni.py." }
 
 $vi = Read-TextFile "version_info.txt"
 $vi = Invoke-Regex $vi 'filevers=\([\d, ]+\)' "filevers=($quad)" 'version_info filevers'
@@ -386,8 +397,11 @@ Detalhe $hash
 Etapa 5 "Manifesto para o Firebase"
 
 $notas = if ($Notes) { $Notes } else { "Versao $Version" }
+# "version" e a versao de ATUALIZACAO (so o updater compara); "displayVersion" e a
+# que o usuario ve. Os nomes de arquivo e a tag usam a versao publica.
 $manifesto = [ordered]@{
-    version   = $Version
+    version        = $updEfetiva
+    displayVersion = $Version
     kind      = "installer"
     url       = "$BaseUrl/v$Version/COGNI-Setup-$Version.exe"
     sha256    = $hash
@@ -403,7 +417,7 @@ $manifesto = [ordered]@{
 # Notas da versao tambem em history/<versao>: quando "stable" avancar, quem
 # atualizar pulando versoes ainda ve o patch notes desta.
 $hist = [ordered]@{ notes = $notas } | ConvertTo-Json -Depth 3
-$vh = $Version.Replace(".", "_")
+$vh = $updEfetiva.Replace(".", "_")
 [System.IO.File]::WriteAllText(
     (Join-Path $DistInstaller "history-$Version.json"),
     $hist, $Utf8SemBom)

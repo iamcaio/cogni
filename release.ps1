@@ -41,6 +41,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [string]$Notes = "",
+    [string]$UpdateVersion = "",
     [string]$RepoPrivado = "iamcaio/cogni",
     [string]$RepoPublico = "iamcaio/cogni-dist",
     [switch]$DryRun,
@@ -88,11 +89,14 @@ if ($OnlyRelease) {
     # abortaria o retry, que e exatamente o que queremos permitir.
     Detalhe "-OnlyRelease: checagem de versao pulada"
 } elseif ($tags.Count -gt 0) {
-    $maior = $tags |
-        ForEach-Object { [version]($_ -replace '^v', '') } |
-        Sort-Object -Descending |
-        Select-Object -First 1
-    if ([version]$Version -le $maior) {
+    # So compara com tags da MESMA linha (major): a versao publica recomecou em 0.x e
+    # o updater usa a versao interna (UpdateVersion), nao esta.
+    $mesma = @($tags | ForEach-Object { [version]($_ -replace '^v', '') } |
+        Where-Object { $_.Major -eq ([version]$Version).Major })
+    $maior = if ($mesma.Count -gt 0) { $mesma | Sort-Object -Descending | Select-Object -First 1 } else { $null }
+    if ($null -eq $maior) {
+        Detalhe "primeira versao da linha $(([version]$Version).Major).x - sem tag anterior para comparar"
+    } elseif ([version]$Version -le $maior) {
         Write-Host ""
         Write-Host "  A versao $Version nao e maior que a ultima tag (v$maior)." -ForegroundColor Red
         Write-Host ""
@@ -102,7 +106,7 @@ if ($OnlyRelease) {
         Write-Host ""
         throw "Use uma versao maior que $maior."
     }
-    Detalhe "ultima tag: v$maior -> publicando $Version"
+    if ($null -ne $maior) { Detalhe "ultima tag: v$maior -> publicando $Version" }
 } else {
     Aviso "nenhuma tag local. Se criou releases pela interface do GitHub,"
     Aviso "rode 'git fetch --tags' antes para esta checagem valer."
@@ -116,6 +120,7 @@ if ($SkipBuild) {
     Detalhe "-SkipBuild: reaproveitando o build existente"
 } else {
     $argsBuild = "-Version $Version -BaseUrl `"https://github.com/$RepoPublico/releases/download`""
+    if ($UpdateVersion) { $argsBuild += " -UpdateVersion $UpdateVersion" }
     if ($Notes) { $argsBuild += " -Notes `"$Notes`"" }
     Executar ".\build.ps1 $argsBuild"
 }
